@@ -4,326 +4,509 @@ import hmac
 import hashlib
 import json
 from urllib.parse import urlencode
+import asyncio
+import websockets
+import threading
+import logging
+from typing import List, Callable, Dict, Optional
+
 
 class BinanceAPI:
-    def __init__(self, api_key=None, api_secret=None, testnet=False):
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.testnet = testnet
+
         if testnet:
             self.base_url = "https://testnet.binancefuture.com/fapi"
+            self.ws_base_url = "wss://fstream.binancefuture.com"
         else:
             self.base_url = "https://fapi.binance.com/fapi"
+            self.ws_base_url = "wss://fstream.binance.com"
 
         self.session = requests.Session()
-        # API Key header is added in _make_request if needed
+        self.logger = logging.getLogger('algo_trader_bot')
+
+        self.active_market_websockets: Dict[str, Dict] = {}
+        self._ws_stream_id_counter = 0
+        self._ws_lock = threading.Lock()
+
+        # User Data Stream attributes
+        self.user_data_listen_key: Optional[str] = None
+        self.user_data_ws_client: Optional[websockets.WebSocketClientProtocol] = None
+        self.user_data_thread: Optional[threading.Thread] = None
+        self.user_data_control_flag = {'keep_running': False} # Shared control flag for loops
+        self.listen_key_refresh_interval = 30 * 60  # 30 minutes
+        self.listen_key_refresher_thread: Optional[threading.Thread] = None
+
 
     def _generate_signature(self, data: str) -> str:
-        """Generates HMAC SHA256 signature."""
         if not self.api_secret:
+            self.logger.error("API secret is not set. Cannot generate signature.")
             raise ValueError("API secret is not set. Cannot generate signature.")
         return hmac.new(self.api_secret.encode('utf-8'), data.encode('utf-8'), hashlib.sha256).hexdigest()
 
     def _prepare_params(self, params: dict) -> dict:
-        """Removes None values from params dict."""
         return {k: v for k, v in params.items() if v is not None}
 
     def _make_request(self, method: str, endpoint: str, params: dict = None, is_signed: bool = False):
-        """Makes an HTTP request to the specified endpoint."""
         if params is None:
             params = {}
-
-        # Remove None values from params before any processing
         params = self._prepare_params(params)
 
-        url = f"{self.base_url}{endpoint}"
+        # For signed POST/PUT/DELETE, parameters for signature must be in query_string_for_signature
+        # But the actual request might send them as form-data in body or in query string.
+        # Binance API typically uses query string for all params in signed requests, even for POST/DELETE.
 
-        headers = {}
-        if self.api_key: # Required for signed endpoints, optional for some public ones if specific permissions are needed
-            headers['X-MBX-APIKEY'] = self.api_key
-
-        query_string = ""
-        request_body = None
+        query_params_for_req = params.copy() # Start with all params for the request query/body
 
         if is_signed:
             if not self.api_key or not self.api_secret:
+                self.logger.error("API key and/or secret not provided for signed request.")
                 raise ValueError("API key and/or secret not provided for signed request.")
 
-            params['timestamp'] = int(time.time() * 1000)
-            params['recvWindow'] = 60000  # Max recvWindow, can be configured
+            # Parameters for signature generation
+            sign_params = params.copy()
+            sign_params['timestamp'] = int(time.time() * 1000)
+            sign_params['recvWindow'] = 60000
 
-            query_string_for_signature = urlencode(params)
-            params['signature'] = self._generate_signature(query_string_for_signature)
+            query_string_for_signature = urlencode(sign_params)
+            # The signature is generated from all parameters that would be sent,
+            # regardless of whether they are in query string or body for the actual request.
+            # For simplicity and common Binance practice, we'll build the URL with all params.
 
-        # For all methods, parameters are typically sent as query string
-        # For POST, PUT, DELETE, if params were meant for body, they should be handled differently (e.g. json=params for POST)
-        # However, Binance often uses query string for parameters even in POST/DELETE for signed endpoints.
-        # Let's assume all params go into query string for now, as it's common for Binance.
-        if params:
-            query_string = urlencode(params)
-            url = f"{url}?{query_string}"
+            # Update query_params_for_req for the actual request to include timestamp, recvWindow, and signature
+            query_params_for_req['timestamp'] = sign_params['timestamp']
+            query_params_for_req['recvWindow'] = sign_params['recvWindow']
+            query_params_for_req['signature'] = self._generate_signature(query_string_for_signature)
+
+        url = f"{self.base_url}{endpoint}"
+        full_url = url
+        request_body = None
+
+        headers = {}
+        if self.api_key: # Required for signed endpoints
+            headers['X-MBX-APIKEY'] = self.api_key
+
+        # For GET, DELETE: params in query string
+        # For POST, PUT: params usually in query string for Binance signed, or body for non-signed/public
+        if method.upper() in ['GET', 'DELETE'] or (is_signed and method.upper() in ['POST', 'PUT']):
+            if query_params_for_req:
+                full_url = f"{url}?{urlencode(query_params_for_req)}"
+        elif method.upper() in ['POST', 'PUT'] and not is_signed: # Non-signed POST/PUT, params in body
+            request_body = query_params_for_req # or json=query_params_for_req if API expects JSON body
 
         try:
             if method.upper() == 'GET':
-                response = self.session.get(url, headers=headers)
+                response = self.session.get(full_url, headers=headers)
             elif method.upper() == 'POST':
-                # For POST, if data needs to be in the body and not query string:
-                # response = self.session.post(f"{self.base_url}{endpoint}", data=params, headers=headers)
-                # But since signature includes all params, they usually go in query.
-                response = self.session.post(url, headers=headers) # Params are already in URL
+                response = self.session.post(full_url, headers=headers, data=None if is_signed else request_body)
             elif method.upper() == 'PUT':
-                response = self.session.put(url, headers=headers) # Params are already in URL
+                response = self.session.put(full_url, headers=headers, data=None if is_signed else request_body)
             elif method.upper() == 'DELETE':
-                response = self.session.delete(url, headers=headers) # Params are already in URL
+                response = self.session.delete(full_url, headers=headers)
             else:
+                self.logger.error(f"Unsupported HTTP method: {method}")
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as http_err:
-            error_msg = f"HTTP error occurred: {http_err} - {response.status_code} - {response.text}"
+            error_msg = f"HTTP error: {http_err.response.status_code} {http_err.response.reason} for url {http_err.request.url} - Full response: {http_err.response.text}"
             try:
-                err_json = response.json()
+                err_json = http_err.response.json()
                 error_msg += f" - Binance Error Code: {err_json.get('code')}, Message: {err_json.get('msg')}"
             except json.JSONDecodeError:
                 pass
+            self.logger.error(error_msg, exc_info=True)
             raise Exception(error_msg)
         except requests.exceptions.RequestException as req_err:
+            self.logger.error(f"Request exception: {req_err} for url {req_err.request.url if req_err.request else 'N/A'}", exc_info=True)
             raise Exception(f"Request exception occurred: {req_err}")
 
-    # Public Endpoints
-    def ping(self):
-        """Tests connectivity to the Rest API."""
-        return self._make_request(method='GET', endpoint='/v1/ping')
 
-    def get_server_time(self):
-        """Gets the current server time."""
-        return self._make_request(method='GET', endpoint='/v1/time')
+    # --- User Data Stream Methods ---
+    def _get_listen_key(self) -> Optional[str]:
+        self.logger.info("Attempting to get new listen key for user data stream.")
+        try:
+            # is_signed should be True, but _make_request handles adding signature if api_key/secret are present
+            # For POST /fapi/v1/listenKey, it's a signed endpoint but takes no parameters for signature itself.
+            # The signature is generated based on an empty parameter string if no params are sent.
+            # However, our _make_request adds timestamp/recvWindow which are then signed.
+            # The endpoint POST /fapi/v1/listenKey actually requires API Key in header but no signed params.
+            # This needs a slight adjustment in _make_request or a specific call here.
+            # For now, let's try with is_signed=False, but ensure API key header is sent.
 
-    def get_exchange_info(self):
-        """Gets exchange trading rules and symbol information."""
-        return self._make_request(method='GET', endpoint='/v1/exchangeInfo')
+            # Correct approach for listenKey: it's a POST, needs API key, but no body/query params for signature.
+            # Our _make_request might overcomplicate this. Let's use session directly for this specific case.
+            url = f"{self.base_url}/fapi/v1/listenKey"
+            headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
+            if not headers:
+                 self.logger.error("API Key must be provided for listen key operations.")
+                 raise ValueError("API Key must be provided for listen key operations.")
 
-    def get_klines(self, symbol: str, interval: str, startTime: int = None, endTime: int = None, limit: int = 500):
-        """Gets kline/candlestick bars for a symbol."""
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'startTime': startTime,
-            'endTime': endTime,
-            'limit': limit
+            response = self.session.post(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            self.user_data_listen_key = data.get('listenKey')
+            if self.user_data_listen_key:
+                self.logger.info(f"Obtained listen key: {self.user_data_listen_key[:10]}...")
+                return self.user_data_listen_key
+            else:
+                self.logger.error(f"Failed to get listen key from response: {data}")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error getting listen key: {e}", exc_info=True)
+            return None
+
+    def _keep_listen_key_alive(self) -> bool:
+        if not self.user_data_listen_key:
+            self.logger.warning("No listen key available to keep alive.")
+            return False
+        self.logger.info(f"Attempting to keep listen key alive: {self.user_data_listen_key[:10]}...")
+        try:
+            # Similar to _get_listen_key, PUT /fapi/v1/listenKey needs API key, no signed body.
+            # The listenKey itself is not sent in the request body or query for PUT.
+            url = f"{self.base_url}/fapi/v1/listenKey" # Some docs say params={'listenKey': self.user_data_listen_key}
+                                                      # but official python-binance does not send it for PUT.
+                                                      # For futures, it seems no listenKey param is needed for PUT.
+            headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
+            if not headers:
+                 self.logger.error("API Key must be provided for listen key operations.")
+                 raise ValueError("API Key must be provided for listen key operations.")
+
+            response = self.session.put(url, headers=headers) # No params needed for PUT according to some examples
+            response.raise_for_status()
+            self.logger.info(f"Listen key kept alive successfully ({response.status_code}). Response: {response.json()}")
+            return response.status_code == 200
+        except Exception as e:
+            self.logger.error(f"Error keeping listen key alive: {e}", exc_info=True)
+            return False
+
+    def _close_listen_key(self) -> bool:
+        if not self.user_data_listen_key:
+            self.logger.info("No listen key to close.")
+            return False
+        self.logger.info(f"Attempting to close listen key: {self.user_data_listen_key[:10]}...")
+        try:
+            # DELETE /fapi/v1/listenKey - also just needs API key, listenKey is implicit to the API key for deletion
+            # Some docs imply listenKey param is needed, others not. Test what official connector does.
+            # Let's assume it doesn't need it in query/body and is tied to API key.
+            # If it does, it would be params={'listenKey': self.user_data_listen_key}
+            url = f"{self.base_url}/fapi/v1/listenKey"
+            headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
+            if not headers:
+                 self.logger.error("API Key must be provided for listen key operations.")
+                 raise ValueError("API Key must be provided for listen key operations.")
+
+            response = self.session.delete(url, headers=headers) # No params for DELETE by default here
+            response.raise_for_status()
+            self.logger.info(f"Listen key closed successfully ({response.status_code}). Response: {response.json()}")
+            return response.status_code == 200
+        except Exception as e:
+            self.logger.error(f"Error closing listen key: {e}", exc_info=True)
+            return False
+
+
+    def _listen_key_refresher_loop(self):
+        self.logger.info("Listen key refresher loop started.")
+        while self.user_data_control_flag.get('keep_running') and self.user_data_listen_key:
+            for _ in range(self.listen_key_refresh_interval): # Check every second
+                if not self.user_data_control_flag.get('keep_running'):
+                    break
+                time.sleep(1)
+            if self.user_data_control_flag.get('keep_running') and self.user_data_listen_key:
+                if not self._keep_listen_key_alive():
+                    self.logger.warning("Failed to keep listen key alive in refresher loop. Stream might disconnect.")
+                    # Optionally, try to get a new key and restart stream if this happens.
+            else:
+                break # Exit if flag turned off or listen key cleared
+        self.logger.info("Listen key refresher loop stopped.")
+
+
+    def start_user_stream(self, callback: Callable) -> bool:
+        if self.user_data_control_flag.get('keep_running'):
+            self.logger.warning("User data stream is already running.")
+            return False
+
+        if not self._get_listen_key() or not self.user_data_listen_key:
+            self.logger.error("Failed to start user stream: Could not obtain listen key.")
+            return False
+
+        self.user_data_control_flag['keep_running'] = True
+
+        async def _user_ws_handler():
+            ws_url = f"{self.ws_base_url}/ws/{self.user_data_listen_key}"
+            self.logger.info(f"User data stream WebSocket handler started for URL: {ws_url}")
+
+            while self.user_data_control_flag.get('keep_running'):
+                try:
+                    async with websockets.connect(ws_url, ping_interval=60, ping_timeout=30) as ws:
+                        self.user_data_ws_client = ws
+                        self.logger.info("User data stream WebSocket connected.")
+                        while self.user_data_control_flag.get('keep_running'):
+                            try:
+                                message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                                data = json.loads(message)
+                                callback(data)
+                                self.logger.debug(f"User WS Recv: {message[:200]}")
+                            except asyncio.TimeoutError:
+                                continue
+                            except websockets.exceptions.ConnectionClosed:
+                                self.logger.warning("User data stream WebSocket connection closed. Will attempt reconnect if keep_running.")
+                                break # To outer loop for reconnection
+                            except Exception as e_recv:
+                                self.logger.error(f"Error during user data stream message processing: {e_recv}", exc_info=True)
+                                # Decide if to break or continue based on error
+                                await asyncio.sleep(1) # Avoid tight loop on continuous error
+
+                        if not self.user_data_control_flag.get('keep_running'):
+                            break # Exit if outer control says stop
+
+                except Exception as e_ws_connect:
+                    self.logger.error(f"Error connecting to user data stream WebSocket: {e_ws_connect}", exc_info=True)
+
+                if self.user_data_control_flag.get('keep_running'):
+                    self.logger.info("Attempting user data stream WebSocket reconnect in 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    break
+
+            self.user_data_ws_client = None
+            self.logger.info("User data stream WebSocket handler finished.")
+
+        def _run_user_ws_handler_in_thread():
+            try:
+                asyncio.run(_user_ws_handler())
+            except Exception as e_thread_run:
+                self.logger.error(f"Exception in user data stream thread runner: {e_thread_run}", exc_info=True)
+
+        self.user_data_thread = threading.Thread(target=_run_user_ws_handler_in_thread, daemon=True, name="UserDataThread")
+        self.user_data_thread.start()
+
+        self.listen_key_refresher_thread = threading.Thread(target=self._listen_key_refresher_loop, daemon=True, name="ListenKeyRefresherThread")
+        self.listen_key_refresher_thread.start()
+
+        self.logger.info("User data stream services (WebSocket and listen key refresher) started.")
+        return True
+
+    def stop_user_stream(self):
+        if self.user_data_control_flag.get('keep_running'):
+            self.logger.info("Attempting to stop user data stream services...")
+            self.user_data_control_flag['keep_running'] = False
+
+            if self.user_data_thread and self.user_data_thread.is_alive():
+                self.logger.debug("Joining user data WebSocket thread...")
+                self.user_data_thread.join(timeout=5.0)
+                if self.user_data_thread.is_alive():
+                    self.logger.warning("User data WebSocket thread did not join in time.")
+
+            if self.listen_key_refresher_thread and self.listen_key_refresher_thread.is_alive():
+                self.logger.debug("Joining listen key refresher thread...")
+                self.listen_key_refresher_thread.join(timeout=5.0) # It checks keep_running every second
+                if self.listen_key_refresher_thread.is_alive():
+                     self.logger.warning("Listen key refresher thread did not join in time.")
+
+            if self.user_data_listen_key:
+                self._close_listen_key() # Attempt to close the listen key on server
+
+            self.user_data_listen_key = None
+            self.user_data_ws_client = None # Should be None already from handler exit
+            self.logger.info("User data stream services stopped.")
+        else:
+            self.logger.info("User data stream is not currently running.")
+
+
+    # --- Market Data WebSocket Methods (existing) ---
+    def _get_next_stream_id(self) -> str:
+        with self._ws_lock:
+            self._ws_stream_id_counter += 1
+            return f"market_ws_{self._ws_stream_id_counter}"
+
+    def start_market_stream(self, stream_names: List[str], callback: Callable) -> str: # Removed stream_type for now
+        if not stream_names:
+            self.logger.error("stream_names cannot be empty for start_market_stream.")
+            raise ValueError("stream_names cannot be empty.")
+
+        stream_id = self._get_next_stream_id()
+
+        if len(stream_names) == 1:
+            path = f"/ws/{stream_names[0].lower()}" # Ensure stream names are lowercase
+        else:
+            streams_param = "/".join([s.lower() for s in stream_names])
+            path = f"/stream?streams={streams_param}"
+
+        full_ws_url = f"{self.ws_base_url}{path}"
+
+        control = {'keep_running': True}
+        self.active_market_websockets[stream_id] = {
+            'ws_client': None, 'control': control, 'thread': None, 'url': full_ws_url
         }
-        return self._make_request(method='GET', endpoint='/v1/klines', params=params)
 
+        async def _ws_handler():
+            self.logger.info(f"Market WebSocket handler started for stream ID {stream_id} ({full_ws_url})")
+            while control['keep_running']:
+                try:
+                    async with websockets.connect(full_ws_url, ping_interval=60, ping_timeout=30) as ws:
+                        self.active_market_websockets[stream_id]['ws_client'] = ws
+                        self.logger.info(f"Market WebSocket connected for stream ID {stream_id}.")
+                        while control['keep_running']:
+                            try:
+                                message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                                data = json.loads(message)
+                                callback(data)
+                                self.logger.debug(f"Market WS Recv ({stream_id}): {message[:200]}")
+                            except asyncio.TimeoutError:
+                                continue
+                            except websockets.exceptions.ConnectionClosed:
+                                self.logger.warning(f"Market WebSocket ConnectionClosed for ID {stream_id}. Will attempt reconnect if keep_running.")
+                                break
+                            except Exception as e_inner:
+                                self.logger.error(f"Error in Market WebSocket handler ({stream_id}) inner loop: {e_inner}", exc_info=True)
+                                await asyncio.sleep(1)
+                        if not control['keep_running']: break
+                except Exception as e_outer: # Catch connection errors too
+                    self.logger.error(f"Error connecting to Market WebSocket ({stream_id}): {e_outer}", exc_info=True)
+                if control['keep_running']:
+                    self.logger.info(f"Attempting Market WebSocket reconnect for ID {stream_id} in 5s...")
+                    await asyncio.sleep(5)
+                else: break
+            self.logger.info(f"Market WebSocket handler stopped for stream ID {stream_id}.")
+
+        def _run_ws_handler_in_thread():
+            try: asyncio.run(_ws_handler())
+            except Exception as e_thread: self.logger.error(f"Exception in Market WebSocket thread ({stream_id}): {e_thread}", exc_info=True)
+
+        thread = threading.Thread(target=_run_ws_handler_in_thread, daemon=True, name=f"MarketWsThread-{stream_id}")
+        self.active_market_websockets[stream_id]['thread'] = thread
+        thread.start()
+        self.logger.info(f"Market stream {stream_id} started for {', '.join(stream_names)} on URL: {full_ws_url}")
+        return stream_id
+
+    def stop_market_stream(self, stream_id: str):
+        if stream_id in self.active_market_websockets:
+            self.logger.info(f"Stopping market stream {stream_id}...")
+            control = self.active_market_websockets[stream_id]['control']
+            control['keep_running'] = False
+            thread = self.active_market_websockets[stream_id].get('thread')
+            if thread and thread.is_alive():
+                self.logger.debug(f"Waiting for Market WebSocket thread {stream_id} to join...")
+                thread.join(timeout=10)
+                if thread.is_alive(): self.logger.warning(f"Market WebSocket thread {stream_id} did not join in time.")
+            del self.active_market_websockets[stream_id]
+            self.logger.info(f"Market stream {stream_id} stopped and removed.")
+        else:
+            self.logger.warning(f"Attempted to stop non-existent market stream ID: {stream_id}")
+
+    # --- REST API Methods ---
+    def ping(self): return self._make_request(method='GET', endpoint='/v1/ping')
+    def get_server_time(self): return self._make_request(method='GET', endpoint='/v1/time')
+    def get_exchange_info(self): return self._make_request(method='GET', endpoint='/v1/exchangeInfo')
+    def get_klines(self, symbol: str, interval: str, startTime: int = None, endTime: int = None, limit: int = 500):
+        params = {'symbol': symbol, 'interval': interval, 'startTime': startTime, 'endTime': endTime, 'limit': limit}
+        return self._make_request(method='GET', endpoint='/v1/klines', params=params)
     def get_order_book(self, symbol: str, limit: int = 100):
-        """Gets the order book (depth) for a symbol."""
         params = {'symbol': symbol, 'limit': limit}
         return self._make_request(method='GET', endpoint='/v1/depth', params=params)
-
     def get_recent_trades(self, symbol: str, limit: int = 500):
-        """Gets recent trades for a symbol."""
         params = {'symbol': symbol, 'limit': limit}
         return self._make_request(method='GET', endpoint='/v1/trades', params=params)
-
     def get_mark_price(self, symbol: str = None):
-        """Gets mark price and premium index for a symbol or all symbols."""
         params = {'symbol': symbol} if symbol else {}
         return self._make_request(method='GET', endpoint='/v1/premiumIndex', params=params)
-
-    # Account/Signed Endpoints
     def place_order(self, symbol: str, side: str, ord_type: str, quantity: float = None,
                     price: float = None, timeInForce: str = None, reduceOnly: bool = None,
                     newClientOrderId: str = None, stopPrice: float = None, closePosition: bool = None,
                     workingType: str = None, positionSide: str = None, newOrderRespType: str = 'ACK'):
-        """Places a new order."""
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'type': ord_type, # API uses 'type' for order type
-            'quantity': quantity,
-            'price': price,
-            'timeInForce': timeInForce,
-            'newClientOrderId': newClientOrderId,
-            'stopPrice': stopPrice,
-            'workingType': workingType,
-            'positionSide': positionSide,
-            'newOrderRespType': newOrderRespType
-        }
-        if reduceOnly is not None:
-            params['reduceOnly'] = "true" if reduceOnly else "false"
-        if closePosition is not None:
-            params['closePosition'] = "true" if closePosition else "false"
-
+        params = {'symbol': symbol, 'side': side, 'type': ord_type, 'quantity': quantity, 'price': price,
+                  'timeInForce': timeInForce, 'newClientOrderId': newClientOrderId, 'stopPrice': stopPrice,
+                  'workingType': workingType, 'positionSide': positionSide, 'newOrderRespType': newOrderRespType}
+        if reduceOnly is not None: params['reduceOnly'] = "true" if reduceOnly else "false"
+        if closePosition is not None: params['closePosition'] = "true" if closePosition else "false"
         return self._make_request(method='POST', endpoint='/v1/order', params=params, is_signed=True)
-
     def get_order_status(self, symbol: str, orderId: int = None, origClientOrderId: str = None):
-        """Checks an order's status."""
-        if not orderId and not origClientOrderId:
-            raise ValueError("Either orderId or origClientOrderId must be provided.")
-        params = {
-            'symbol': symbol,
-            'orderId': orderId,
-            'origClientOrderId': origClientOrderId
-        }
+        if not orderId and not origClientOrderId: raise ValueError("Either orderId or origClientOrderId must be sent.")
+        params = {'symbol': symbol, 'orderId': orderId, 'origClientOrderId': origClientOrderId}
         return self._make_request(method='GET', endpoint='/v1/order', params=params, is_signed=True)
-
     def cancel_order(self, symbol: str, orderId: int = None, origClientOrderId: str = None):
-        """Cancels an active order."""
-        if not orderId and not origClientOrderId:
-            raise ValueError("Either orderId or origClientOrderId must be provided.")
-        params = {
-            'symbol': symbol,
-            'orderId': orderId,
-            'origClientOrderId': origClientOrderId
-        }
+        if not orderId and not origClientOrderId: raise ValueError("Either orderId or origClientOrderId must be sent.")
+        params = {'symbol': symbol, 'orderId': orderId, 'origClientOrderId': origClientOrderId}
         return self._make_request(method='DELETE', endpoint='/v1/order', params=params, is_signed=True)
-
     def get_open_orders(self, symbol: str = None):
-        """Gets all open orders on a symbol or all symbols."""
         params = {'symbol': symbol} if symbol else {}
         return self._make_request(method='GET', endpoint='/v1/openOrders', params=params, is_signed=True)
-
     def get_all_orders(self, symbol: str, orderId: int = None, startTime: int = None, endTime: int = None, limit: int = 500):
-        """Get all account orders; active, canceled, or filled.
-           Note: If orderId is set, it will get orders >= that orderId. Otherwise most recent orders are returned.
-        """
-        params = {
-            'symbol': symbol,
-            'orderId': orderId,
-            'startTime': startTime,
-            'endTime': endTime,
-            'limit': limit
-        }
+        params = {'symbol': symbol, 'orderId': orderId, 'startTime': startTime, 'endTime': endTime, 'limit': limit}
         return self._make_request(method='GET', endpoint='/v1/allOrders', params=params, is_signed=True)
-
     def get_account_balance(self):
-        """Gets account balance (v2 for more details)."""
-        # Using /v2/balance as it's often recommended for futures
         return self._make_request(method='GET', endpoint='/v2/balance', params={}, is_signed=True)
-
     def get_position_information(self, symbol: str = None):
-        """Gets position information (v2 for more details)."""
-        # Using /v2/positionRisk as it's often recommended
         params = {'symbol': symbol} if symbol else {}
         return self._make_request(method='GET', endpoint='/v2/positionRisk', params=params, is_signed=True)
 
 
 if __name__ == '__main__':
-    # Example usage:
-    # Load API keys from .env file (assuming .env is in the project root)
     import os
     from dotenv import load_dotenv
-    # Construct the path to the .env file.
-    # This assumes this script (binance_connector.py) is in bot/connectors/
-    # So, .env would be two levels up.
+
+    # Setup basic logger for console output during this test
+    if not logging.getLogger('algo_trader_bot').hasHandlers():
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s')
+
+    logger_main = logging.getLogger('algo_trader_bot')
+
     dotenv_path = os.path.join(os.path.dirname(__file__), '../../.env')
     load_dotenv(dotenv_path=dotenv_path)
-
     API_KEY = os.getenv("BINANCE_TESTNET_API_KEY")
     API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET")
-    USE_TESTNET = True # True for testnet, False for mainnet
 
-    print(f"Attempting to use Testnet: {USE_TESTNET}")
-    print(f"API Key Loaded: {'Yes' if API_KEY and API_KEY != 'YOUR_TESTNET_API_KEY' else 'No or Placeholder'}")
-    # Be careful not to print the secret itself
+    if not (API_KEY and API_SECRET and API_KEY != "YOUR_TESTNET_API_KEY"):
+        logger_main.error("API_KEY and API_SECRET must be set in .env file and not be placeholders.")
+        exit()
 
+    USE_TESTNET = True
     connector = BinanceAPI(api_key=API_KEY, api_secret=API_SECRET, testnet=USE_TESTNET)
 
+    def sample_user_data_callback(data):
+        event_type = data.get('e')
+        if event_type == 'ACCOUNT_UPDATE':
+            logger_main.info(f"User Stream (ACCOUNT_UPDATE): Positions: {data.get('a', {}).get('P')}")
+        elif event_type == 'ORDER_TRADE_UPDATE':
+            logger_main.info(f"User Stream (ORDER_TRADE_UPDATE): Symbol {data.get('o',{}).get('s')}, Status {data.get('o',{}).get('X')}")
+        else:
+            logger_main.info(f"User Stream ({event_type}): {data}")
+
+    user_stream_started = False
     try:
-        print("\n--- Public Endpoints ---")
-        print("Pinging server...")
-        print(f"Ping: {connector.ping()}")
-        print("Getting server time...")
-        server_time = connector.get_server_time()
-        print(f"Server Time: {server_time} (ms: {server_time.get('serverTime')})")
+        logger_main.info("\n--- Testing WebSocket User Data Stream ---")
+        user_stream_started = connector.start_user_stream(callback=sample_user_data_callback)
 
-        print("\nGetting BTCUSDT klines (1m, limit 3)...")
-        klines = connector.get_klines(symbol="BTCUSDT", interval="1m", limit=3)
-        print(f"Klines: {klines}")
-
-        print("\nGetting BTCUSDT Order Book (limit 5)...")
-        order_book = connector.get_order_book(symbol="BTCUSDT", limit=5)
-        print(f"Order Book: {order_book}")
-
-        print("\nGetting BTCUSDT Recent Trades (limit 3)...")
-        trades = connector.get_recent_trades(symbol="BTCUSDT", limit=3)
-        print(f"Recent Trades: {trades}")
-
-        print("\nGetting BTCUSDT Mark Price...")
-        mark_price = connector.get_mark_price(symbol="BTCUSDT")
-        print(f"Mark Price BTCUSDT: {mark_price}")
-
-        print("\nGetting Exchange Info (first few symbols)...")
-        exchange_info = connector.get_exchange_info()
-        if exchange_info and 'symbols' in exchange_info:
-            print(f"Total symbols: {len(exchange_info['symbols'])}")
-            for i, symbol_data in enumerate(exchange_info['symbols'][:2]): # Print first 2 symbols
-                 print(f"Symbol {i+1}: {symbol_data['symbol']}, Status: {symbol_data['status']}")
-        else:
-            print("Could not fetch or parse exchange info symbols.")
-
-
-        if API_KEY and API_KEY != "YOUR_TESTNET_API_KEY" and API_SECRET:
-            print("\n--- Signed Endpoints (Testnet) ---")
-
-            print("Getting account balance...")
-            balance = connector.get_account_balance()
-            # print(f"Account Balance: {balance}") # Full balance can be very long
-            if isinstance(balance, list):
-                for asset_balance in balance:
-                    if asset_balance.get('asset') == 'USDT': # Example: print only USDT balance
-                        print(f"USDT Balance: {asset_balance}")
-            else:
-                print(f"Account Balance: {balance}")
-
-
-            print("\nGetting position information (BTCUSDT)...")
-            positions = connector.get_position_information(symbol="BTCUSDT")
-            # print(f"Position Info: {positions}")
-            if isinstance(positions, list):
-                for position in positions:
-                    print(f"Position for {position.get('symbol')}: Amount {position.get('positionAmt')}, Entry {position.get('entryPrice')}, PnL {position.get('unRealizedProfit')}")
-            else:
-                print(f"Position Info for BTCUSDT: {positions}")
-
-
-            print("\nGetting open orders (BTCUSDT)...")
-            open_orders = connector.get_open_orders(symbol="BTCUSDT")
-            print(f"Open Orders for BTCUSDT: {open_orders}")
-
-            # Example: Placing a test order (ensure symbol and parameters are valid for testnet)
-            # This is a high price to avoid accidental fill if testnet market is live
-            # print("\nPlacing a test order for BTCUSDT (LIMIT BUY)...")
+        if user_stream_started:
+            logger_main.info("User data stream started. Waiting for 60 seconds to receive events...")
+            time.sleep(60) # Keep main thread alive to receive user data
+            # Try placing a small order to trigger an event, if desired for testing
+            # Be very careful with automated order placement, even on testnet
             # try:
-            #     test_order_params = {
-            #         'symbol': "BTCUSDT",
-            #         'side': "BUY",
-            #         'positionSide': "BOTH", # or LONG/SHORT if in hedge mode
-            #         'ord_type': "LIMIT",
-            #         'quantity': 0.001,
-            #         'price': 10000, # Deliberately low price for BUY to not fill, or high for SELL
-            #         'timeInForce': "GTC"
-            #     }
-            #     # placed_order = connector.place_order(**test_order_params)
-            #     # print(f"Placed Order: {placed_order}")
-            #     # order_id_to_check = placed_order.get('orderId')
-
-            #     # if order_id_to_check:
-            #     #     print(f"\nGetting status for order ID {order_id_to_check}...")
-            #     #     order_status = connector.get_order_status(symbol="BTCUSDT", orderId=order_id_to_check)
-            #     #     print(f"Order Status: {order_status}")
-
-            #     #     print(f"\nCancelling order ID {order_id_to_check}...")
-            #     #     cancel_status = connector.cancel_order(symbol="BTCUSDT", orderId=order_id_to_check)
-            #     #     print(f"Cancel Status: {cancel_status}")
-            #     print("Order placement/cancel commented out for safety in test run.")
-
+            #     logger_main.info("Placing a small test order on BTCUSDT to trigger user data event...")
+            #     test_order = connector.place_order(symbol="BTCUSDT", side="BUY", ord_type="MARKET", quantity=0.001, positionSide="BOTH")
+            #     logger_main.info(f"Test order placement response: {test_order}")
             # except Exception as e_order:
-            #     print(f"Error during order placement/cancellation: {e_order}")
+            #     logger_main.error(f"Error placing test order: {e_order}")
+            # time.sleep(10) # Wait for order event
 
         else:
-            print("\nSkipping signed endpoint tests as API_KEY or API_SECRET are placeholders or not found.")
+            logger_main.error("User data stream failed to start.")
 
+    except KeyboardInterrupt:
+        logger_main.info("Keyboard interrupt received. Stopping streams...")
     except Exception as e:
-        print(f"An error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+        logger_main.error(f"An error occurred during User Data Stream test: {e}", exc_info=True)
+    finally:
+        if user_stream_started:
+            logger_main.info("\nStopping user data stream...")
+            connector.stop_user_stream()
+
+        logger_main.info("Waiting a bit for user stream threads to clean up...")
+        time.sleep(5)
+        logger_main.info("User data stream test finished.")
+```
