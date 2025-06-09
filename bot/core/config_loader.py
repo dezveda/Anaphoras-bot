@@ -1,114 +1,183 @@
 import os
 import logging
-from dotenv import load_dotenv
+import json
+from dotenv import load_dotenv, set_key, find_dotenv
+from typing import Tuple, Optional, Dict, Any
 
-def _load_env(env_file_path: str = None):
-    """Helper function to load .env file."""
-    if env_file_path:
-        load_dotenv(dotenv_path=env_file_path)
-    else:
-        # load_dotenv will search for .env in the current directory and parent directories.
-        # For a typical project structure where .env is in the root:
-        # If this script is in bot/core/, path to root .env is ../../.env
-        # Providing a default search path can be helpful.
-        default_path = os.path.join(os.path.dirname(__file__), '../../.env')
-        if os.path.exists(default_path):
-            load_dotenv(dotenv_path=default_path)
+class ConfigManager:
+    def __init__(self,
+                 config_file_path: str = 'bot_config.json',
+                 env_file_path: Optional[str] = None):
+        self.logger = logging.getLogger('algo_trader_bot.ConfigManager')
+
+        # Determine .env file path
+        if env_file_path:
+            self.env_file_path = env_file_path
         else:
-            load_dotenv() # Standard search if default_path not found
+            self.env_file_path = find_dotenv(usecwd=True, raise_error_if_not_found=False)
+            if not self.env_file_path or not os.path.exists(self.env_file_path):
+                project_root_guess = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+                self.env_file_path = os.path.join(project_root_guess, '.env')
+
+        # Ensure .env file exists for dotenv operations, even if empty
+        if not os.path.exists(self.env_file_path):
+            try:
+                with open(self.env_file_path, 'w') as f: # Create empty .env if not exists
+                    pass
+                self.logger.info(f"Created empty .env file at: {self.env_file_path}")
+            except IOError as e:
+                self.logger.error(f"Could not create .env file at {self.env_file_path}: {e}")
+                # Proceeding without a writable .env file might cause issues for saving API keys.
+
+        self.config_file_path = config_file_path
+        self.logger.info(f"ConfigManager initialized. JSON config: '{self.config_file_path}', ENV config: '{self.env_file_path}'")
+        self._load_env() # Initial load of .env variables
+
+    def _load_env(self):
+        """Loads environment variables from the .env file."""
+        # load_dotenv will not override existing system environment variables by default.
+        # If override is needed (e.g. .env should always take precedence), set override=True.
+        if self.env_file_path and os.path.exists(self.env_file_path):
+            load_dotenv(dotenv_path=self.env_file_path, override=True)
+            self.logger.debug(f"Environment variables loaded from: {self.env_file_path}")
+        else:
+            self.logger.debug(f".env file not found at {self.env_file_path}. Using system environment variables or defaults.")
 
 
-def load_api_keys(env_file_path: str = None) -> tuple[str | None, str | None]:
-    """
-    Loads Binance API key and secret from a .env file.
+    def load_api_keys(self, use_testnet: bool = False) -> Tuple[Optional[str], Optional[str]]:
+        self._load_env() # Ensure latest .env values are loaded
+        key_name_prefix = "BINANCE_TESTNET" if use_testnet else "BINANCE_MAINNET"
+        api_key = os.getenv(f"{key_name_prefix}_API_KEY")
+        api_secret = os.getenv(f"{key_name_prefix}_API_SECRET")
 
-    Args:
-        env_file_path (str, optional): Path to the .env file.
-                                       If None, uses a default path or standard dotenv search.
-    Returns:
-        tuple[str | None, str | None]: (api_key, api_secret)
-    """
-    _load_env(env_file_path)
+        placeholder_key = f"YOUR_{'TESTNET' if use_testnet else 'MAINNET'}_API_KEY"
+        placeholder_secret = f"YOUR_{'TESTNET' if use_testnet else 'MAINNET'}_API_SECRET"
 
-    api_key = os.getenv("BINANCE_TESTNET_API_KEY")
-    api_secret = os.getenv("BINANCE_TESTNET_API_SECRET")
+        if api_key == placeholder_key: api_key = None
+        if api_secret == placeholder_secret: api_secret = None
 
-    # Example for switching to Mainnet if needed (e.g., based on another env var)
-    # if os.getenv("USE_MAINNET_KEYS") == "true":
-    #     api_key = os.getenv("BINANCE_MAINNET_API_KEY")
-    #     api_secret = os.getenv("BINANCE_MAINNET_API_SECRET")
+        return api_key, api_secret
 
-    return api_key, api_secret
+    def save_api_key_to_env(self, key_name: str, key_value: str) -> bool:
+        """Saves a single API key (or secret) to the .env file."""
+        try:
+            # Create .env if it doesn't exist, as set_key might require it.
+            if not os.path.exists(self.env_file_path):
+                with open(self.env_file_path, 'w'): pass
 
-def load_log_level(env_file_path: str = None) -> int:
-    """
-    Loads the logging level from a .env file.
+            success = set_key(self.env_file_path, key_name, key_value, quote_mode="always")
+            if success:
+                self.logger.info(f"Saved {key_name} to {self.env_file_path}")
+                self._load_env() # Reload env vars after change
+            else:
+                self.logger.error(f"Failed to save {key_name} to {self.env_file_path} using set_key.")
+            return success
+        except Exception as e:
+            self.logger.error(f"Exception saving {key_name} to .env: {e}", exc_info=True)
+            return False
 
-    Args:
-        env_file_path (str, optional): Path to the .env file.
-                                       If None, uses a default path or standard dotenv search.
-    Returns:
-        int: The logging level (e.g., logging.INFO, logging.DEBUG). Defaults to logging.INFO.
-    """
-    _load_env(env_file_path)
+    def load_log_level_from_env(self) -> int: # Renamed to be specific
+        self._load_env()
+        level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
+        return getattr(logging, level_str, logging.INFO)
 
+    def save_app_config(self, config_data: Dict[str, Any]):
+        try:
+            with open(self.config_file_path, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            self.logger.info(f"Application config saved to {self.config_file_path}")
+        except IOError as e:
+            self.logger.error(f"Error saving app config to {self.config_file_path}: {e}", exc_info=True)
+
+    def load_app_config(self) -> Optional[Dict[str, Any]]:
+        if not os.path.exists(self.config_file_path):
+            self.logger.info(f"App config file {self.config_file_path} not found. Returning None.")
+            return None # Or return a default config structure: {'general_settings': {}, 'strategies': {}}
+        try:
+            with open(self.config_file_path, 'r') as f:
+                config_data = json.load(f)
+                self.logger.info(f"Application config loaded from {self.config_file_path}")
+                return config_data
+        except (IOError, json.JSONDecodeError) as e:
+            self.logger.error(f"Error loading app config from {self.config_file_path}: {e}", exc_info=True)
+            return None
+
+
+# Standalone functions for initial setup before ConfigManager might be fully available
+def load_log_level(env_file_path: Optional[str] = None) -> int:
+    """Loads log level from .env, for early logger setup. Uses basic dotenv loading."""
+    load_dotenv(dotenv_path=env_file_path if env_file_path and os.path.exists(env_file_path) else find_dotenv(usecwd=True, raise_error_if_not_found=False))
     level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
-    level_mapping = {
-        'DEBUG': logging.DEBUG,
-        'INFO': logging.INFO,
-        'WARNING': logging.WARNING,
-        'ERROR': logging.ERROR,
-        'CRITICAL': logging.CRITICAL
-    }
-    return level_mapping.get(level_str, logging.INFO)
+    return getattr(logging, level_str, logging.INFO)
+
+def initial_load_api_keys(use_testnet: bool = False, env_file_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Loads API keys from .env, for early setup. Uses basic dotenv loading."""
+    load_dotenv(dotenv_path=env_file_path if env_file_path and os.path.exists(env_file_path) else find_dotenv(usecwd=True, raise_error_if_not_found=False))
+    key_name_prefix = "BINANCE_TESTNET" if use_testnet else "BINANCE_MAINNET"
+    api_key = os.getenv(f"{key_name_prefix}_API_KEY")
+    api_secret = os.getenv(f"{key_name_prefix}_API_SECRET")
+    placeholder_key = f"YOUR_{'TESTNET' if use_testnet else 'MAINNET'}_API_KEY"
+    placeholder_secret = f"YOUR_{'TESTNET' if use_testnet else 'MAINNET'}_API_SECRET"
+    if api_key == placeholder_key: api_key = None
+    if api_secret == placeholder_secret: api_secret = None
+    return api_key, api_secret
 
 
 if __name__ == '__main__':
-    # This example assumes .env might be in the project root (../../.env)
-    # Create a dummy .env at that location for testing this script directly.
-    # Example:
-    # .env file content:
-    # BINANCE_TESTNET_API_KEY="your_test_key"
-    # BINANCE_TESTNET_API_SECRET="your_test_secret"
-    # LOG_LEVEL="DEBUG"
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger('test_config_manager')
 
-    print("--- Testing config_loader.py ---")
+    # Test with specific paths (assuming .env and bot_config.json are in CWD for this test)
+    test_env_path = ".env.test_config_loader"
+    test_json_path = "bot_config.test_config_loader.json"
 
-    # Test load_api_keys
-    key, secret = load_api_keys() # Will use _load_env's default logic
-    print(f"Loaded API Keys: Key set: {bool(key)}, Secret set: {bool(secret)}")
-    if not key or not secret:
-        print("  Note: API keys not found. Ensure .env is in the project root with BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET.")
+    # Create dummy .env for testing
+    with open(test_env_path, "w") as f:
+        f.write("BINANCE_TESTNET_API_KEY=test_key_123\n")
+        f.write("BINANCE_TESTNET_API_SECRET=test_secret_456\n")
+        f.write("LOG_LEVEL=DEBUG\n")
 
-    # Test load_log_level
-    log_level_int = load_log_level()
-    log_level_name = logging.getLevelName(log_level_int)
-    print(f"Loaded Log Level: {log_level_name} (Value: {log_level_int})")
-    if log_level_name == 'INFO' and os.getenv('LOG_LEVEL') is None:
-        print("  Note: LOG_LEVEL not found in .env, defaulted to INFO.")
-    elif os.getenv('LOG_LEVEL'):
-        print(f"  LOG_LEVEL found in .env: {os.getenv('LOG_LEVEL')}")
-    else:
-        print("  LOG_LEVEL not found, and it defaulted to INFO.")
+    cm = ConfigManager(config_file_path=test_json_path, env_file_path=test_env_path)
 
-    # Example of using these with other modules (conceptual)
-    # from ..connectors.binance_connector import BinanceAPI
-    # from .logger_setup import setup_logger
+    logger.info("--- Testing ConfigManager ---")
+    # Test API Key Loading
+    tn_key, tn_secret = cm.load_api_keys(use_testnet=True)
+    logger.info(f"Testnet Keys: Key='{tn_key}', Secret Present: {bool(tn_secret)}")
+    assert tn_key == "test_key_123"
 
-    # if key and secret:
-    #     current_log_level = load_log_level()
-    #     logger = setup_logger(level=current_log_level)
-    #     logger.info("Logger configured with level from .env")
+    # Test Log Level Loading (from env)
+    log_lvl = cm.load_log_level_from_env()
+    logger.info(f"Log Level from env: {logging.getLevelName(log_lvl)}")
+    assert log_lvl == logging.DEBUG
 
-    #     connector = BinanceAPI(api_key=key, api_secret=secret, testnet=True)
-    #     try:
-    #         logger.debug(f"Pinging Binance with loaded keys...")
-    #         ping_result = connector.ping()
-    #         logger.info(f"Ping successful: {ping_result}")
-    #     except Exception as e:
-    #         logger.error(f"Error pinging Binance: {e}")
-    # else:
-    #     print("Cannot fully test without API keys in .env")
-    print("--- End of config_loader.py test ---")
+    # Test App Config Save/Load
+    test_app_config = {
+        "general_settings": {"log_level": "INFO", "some_other_setting": True},
+        "strategies": {"strat1": {"type_name": "Pivot", "params": {"p1": 10}}}
+    }
+    cm.save_app_config(test_app_config)
+    loaded_app_config = cm.load_app_config()
+    logger.info(f"Loaded App Config: {loaded_app_config}")
+    assert loaded_app_config == test_app_config
 
+    # Test saving a specific API key
+    cm.save_api_key_to_env("BINANCE_TESTNET_API_KEY", "new_test_key_789")
+    new_tn_key, _ = cm.load_api_keys(use_testnet=True)
+    logger.info(f"New Testnet Key after save: {new_tn_key}")
+    assert new_tn_key == "new_test_key_789"
+
+    # Cleanup test files
+    if os.path.exists(test_env_path): os.remove(test_env_path)
+    if os.path.exists(test_json_path): os.remove(test_json_path)
+    logger.info("--- ConfigManager Test Finished ---")
+
+    # Test standalone functions (used for initial logger setup before CM instance)
+    logger.info("--- Testing Standalone Config Functions ---")
+    # Create dummy .env in CWD if needed for this part of test
+    with open(".env", "w") as f: # Assuming CWD is project root for this test
+        f.write("LOG_LEVEL=WARNING\n")
+    initial_log_lvl = load_log_level() # Test with default path search
+    logger.info(f"Standalone load_log_level: {logging.getLevelName(initial_log_lvl)}")
+    assert initial_log_lvl == logging.WARNING
+    if os.path.exists(".env"): os.remove(".env") # Clean up CWD .env
 ```
