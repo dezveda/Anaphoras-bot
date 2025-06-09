@@ -3,25 +3,26 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Type, Any, Callable # Added Callable
-import asyncio # Added asyncio
+from typing import Dict, List, Optional, Type, Any, Callable, Awaitable
+import asyncio
+import numpy as np
 
-# Assuming these are accessible, adjust paths if necessary
 try:
     from bot.core.data_fetcher import MarketDataProvider
     from bot.strategies.base_strategy import BaseStrategy
-    # OrderManager is not directly used as a dependency by BacktestEngine,
-    # but BacktestEngine implements a compatible interface for the strategy.
+    from bot.core.risk_manager import BasicRiskManager
 except ImportError:
-    # Fallbacks for local testing or if structure is slightly different
-    from data_fetcher import MarketDataProvider
-    # Need to ensure strategies.base_strategy is findable if running this file directly
-    import sys
-    sys.path.append('../strategies') # Assuming strategies is one level up from core if running from core
-    from base_strategy import BaseStrategy
+    from data_fetcher import MarketDataProvider # type: ignore
+    import sys, os # type: ignore
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../strategies'))  # type: ignore
+    from base_strategy import BaseStrategy # type: ignore
+    sys.path.append(os.path.join(os.path.dirname(__file__), '.'))
+    from risk_manager import BasicRiskManager # type: ignore
 
 
 class BacktestEngine:
+    _KLINE_INTERVAL_MILLISECONDS = MarketDataProvider._KLINE_INTERVAL_MILLISECONDS
+
     def __init__(self,
                  market_data_provider: MarketDataProvider,
                  strategy_class: Type[BaseStrategy],
@@ -31,11 +32,11 @@ class BacktestEngine:
                  initial_capital: float,
                  symbol: str,
                  timeframe: str,
-                 commission_rate: float = 0.0004): # 0.04%
+                 commission_rate: float = 0.0004):
 
         self.market_data_provider = market_data_provider
         self.strategy_class = strategy_class
-        self.strategy_params = strategy_params
+        self.strategy_params = strategy_params # Store all params
         self.start_date_str = start_date_str
         self.end_date_str = end_date_str
         self.initial_capital = initial_capital
@@ -47,406 +48,303 @@ class BacktestEngine:
 
         self.historical_data: Optional[pd.DataFrame] = None
         self.simulated_trades: List[Dict[str, Any]] = []
-        self.equity_curve: List[Dict[str, Any]] = []
+        # Initialize equity curve with the starting capital point
+        start_dt = pd.to_datetime(self.start_date_str, utc=True) if self.start_date_str else datetime.now(timezone.utc)
+        self.equity_curve: List[Dict[str, Any]] = [{'timestamp': start_dt - pd.Timedelta(milliseconds=1), 'balance': self.initial_capital}]
+
 
         self.current_balance = initial_capital
-        # Position: {'side': 'LONG'/'SHORT', 'entry_price': float, 'quantity': float, 'entry_timestamp': datetime, 'value': float}
         self.current_position: Optional[Dict[str, Any]] = None
 
         self.strategy_instance: Optional[BaseStrategy] = None
-        self._current_kline_index = 0 # To help strategy get current price if needed
+        self._current_kline_index = 0
+
+        self.atr_period = int(strategy_params.get('atr_period_for_backtest', 14))
+
+        # Performance metrics initialization
+        self.total_pnl = 0.0
+        self.num_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.gross_profit = 0.0
+        self.gross_loss = 0.0
+        self.max_drawdown = 0.0
+        self._peak_equity = initial_capital
+
+        self.risk_manager = BasicRiskManager(
+            account_balance_provider_fn=self.get_available_trading_balance,
+            default_risk_per_trade_perc=float(strategy_params.get('default_risk_per_trade_perc', 0.01)) # Ensure float
+        )
+
+    async def get_available_trading_balance(self) -> Optional[float]:
+        return float(self.current_balance)
 
     def _generate_client_order_id(self, strategy_id: str = "backtest") -> str:
         prefix = strategy_id.replace("_", "")[:10]
-        timestamp_ms = int(time.time() * 1000 * 1000) # Microseconds for more uniqueness
-        return f"{prefix}bt{timestamp_ms}"[:36]
+        # Use nanoseconds for higher probability of uniqueness if tests run very fast
+        timestamp_ns = time.time_ns()
+        return f"{prefix}bt{timestamp_ns}"[:36] # Ensure it's max 36 chars
 
     async def _prepare_data(self) -> bool:
         self.logger.info(f"Preparing historical data for {self.symbol} ({self.timeframe}) from {self.start_date_str} to {self.end_date_str}")
         try:
-            # Fetch a bit more data before start_date if strategy needs warmup, then slice if necessary
-            # For now, fetching exact range. Limit is large to get all data in range.
-            self.historical_data = await asyncio.to_thread(
-                self.market_data_provider.get_historical_klines,
-                symbol=self.symbol,
-                interval=self.timeframe,
-                start_str=self.start_date_str,
-                end_str=self.end_date_str,
-                limit=999999 # Effectively get all data in the range
+            self.historical_data = await self.market_data_provider.get_historical_klines(
+                symbol=self.symbol, interval=self.timeframe,
+                start_str=self.start_date_str, end_str=self.end_date_str,
+                limit=9999999 # Request a large limit to get all data in the date range
             )
             if self.historical_data is None or self.historical_data.empty:
                 self.logger.error("Failed to fetch historical data or no data available for the period.")
                 return False
 
-            # Ensure data is sorted by timestamp
             self.historical_data.sort_index(inplace=True)
+
+            if len(self.historical_data) > self.atr_period:
+                df = self.historical_data
+                df['high'] = df['high'].astype(float)
+                df['low'] = df['low'].astype(float)
+                df['close'] = df['close'].astype(float)
+
+                high_low = df['high'] - df['low']
+                high_close = np.abs(df['high'] - df['close'].shift(1))
+                low_close = np.abs(df['low'] - df['close'].shift(1))
+
+                ranges_df = pd.DataFrame({'hl': high_low, 'hc': high_close, 'lc': low_close})
+                true_range = ranges_df.max(axis=1)
+
+                df['atr'] = true_range.ewm(span=self.atr_period, adjust=False, min_periods=self.atr_period).mean()
+                self.historical_data = df
+                self.logger.info(f"ATR (period {self.atr_period}) calculated and added to historical data.")
+            else:
+                self.logger.warning(f"Not enough data ({len(self.historical_data)} rows) to calculate ATR with period {self.atr_period}. ATR will be NaN.")
+                self.historical_data['atr'] = np.nan # Add NaN column if ATR can't be calculated
+
             self.logger.info(f"Successfully loaded {len(self.historical_data)} klines.")
             return True
         except Exception as e:
             self.logger.error(f"Error during historical data preparation: {e}", exc_info=True)
             return False
 
-    def _simulate_market_order(self, side: str, quantity_asset: float, execution_price: float, execution_timestamp: datetime):
-        commission = quantity_asset * execution_price * self.commission_rate
-        self.current_balance -= commission
+    def _simulate_market_order(self, side: str, quantity_asset: float, execution_price: float, execution_timestamp: datetime,
+                               client_order_id: str, order_type: str, original_price: Optional[float] = None):
+        commission_this_trade = quantity_asset * execution_price * self.commission_rate
+        self.current_balance -= commission_this_trade
 
         trade_value = quantity_asset * execution_price
-        pnl = 0
+        pnl_this_trade = 0.0
+        closed_position_value = 0.0
+        entry_time_of_closed_pos = None
 
-        if self.current_position: # Existing position
-            if self.current_position['side'] == side: # Increasing position size
-                current_value = self.current_position['quantity'] * self.current_position['entry_price']
+        if self.current_position:
+            if self.current_position['side'] == side: # Increasing position
+                current_total_value = self.current_position['quantity'] * self.current_position['entry_price']
                 new_total_quantity = self.current_position['quantity'] + quantity_asset
-                new_total_value = current_value + trade_value
-                self.current_position['entry_price'] = new_total_value / new_total_quantity
+                self.current_position['entry_price'] = (current_total_value + trade_value) / new_total_quantity
                 self.current_position['quantity'] = new_total_quantity
-                self.current_position['value'] = new_total_value # or keep track of margin used
-            else: # Reducing or closing position
-                if quantity_asset >= self.current_position['quantity']: # Closing position or more
-                    closed_quantity = self.current_position['quantity']
-                    if side == "SELL": # Closing a LONG
-                        pnl = (execution_price - self.current_position['entry_price']) * closed_quantity
-                    else: # Closing a SHORT
-                        pnl = (self.current_position['entry_price'] - execution_price) * closed_quantity
+            else: # Reducing or flipping position
+                closed_quantity = min(quantity_asset, self.current_position['quantity'])
+                entry_time_of_closed_pos = self.current_position['entry_timestamp']
+                closed_position_value = closed_quantity * self.current_position['entry_price']
 
-                    self.current_balance += pnl
-                    self.current_position = None # Position closed
-                    if quantity_asset > closed_quantity: # Flipped position
+                if self.current_position['side'] == "LONG":
+                    pnl_this_trade = (execution_price - self.current_position['entry_price']) * closed_quantity
+                else: # SHORT
+                    pnl_this_trade = (self.current_position['entry_price'] - execution_price) * closed_quantity
+
+                self.current_balance += pnl_this_trade
+                self.total_pnl += pnl_this_trade # Accumulate total PnL
+                if pnl_this_trade > 0:
+                    self.winning_trades += 1
+                    self.gross_profit += pnl_this_trade
+                elif pnl_this_trade < 0:
+                    self.losing_trades += 1
+                    self.gross_loss += abs(pnl_this_trade) # Gross loss is positive value
+
+                if quantity_asset >= self.current_position['quantity']: # Position closed or flipped
+                    self.current_position = None
+                    if quantity_asset > closed_quantity: # Flipped
                         remaining_qty = quantity_asset - closed_quantity
-                        self.current_position = {
-                            'side': side,
-                            'entry_price': execution_price,
-                            'quantity': remaining_qty,
-                            'entry_timestamp': execution_timestamp,
-                            'value': remaining_qty * execution_price
-                        }
-                else: # Reducing position size
-                    closed_quantity = quantity_asset
-                    if side == "SELL": # Reducing a LONG
-                        pnl = (execution_price - self.current_position['entry_price']) * closed_quantity
-                    else: # Reducing a SHORT
-                        pnl = (self.current_position['entry_price'] - execution_price) * closed_quantity
-                    self.current_balance += pnl
+                        self.current_position = {'side': side, 'entry_price': execution_price,
+                                                 'quantity': remaining_qty, 'entry_timestamp': execution_timestamp}
+                else: # Partially closed
                     self.current_position['quantity'] -= closed_quantity
-                    # Entry price of remaining position does not change
         else: # Opening new position
-            self.current_position = {
-                'side': side,
-                'entry_price': execution_price,
-                'quantity': quantity_asset,
-                'entry_timestamp': execution_timestamp,
-                'value': trade_value
-            }
+            self.current_position = {'side': side, 'entry_price': execution_price,
+                                     'quantity': quantity_asset, 'entry_timestamp': execution_timestamp}
 
+        self.num_trades += 1
         trade_record = {
-            'timestamp': execution_timestamp,
-            'symbol': self.symbol,
-            'type': 'MARKET',
-            'side': side,
-            'price': execution_price,
-            'quantity': quantity_asset,
-            'commission': commission,
-            'pnl': pnl, # PnL from this trade if it closed/reduced a position
-            'balance': self.current_balance
+            'client_order_id': client_order_id, 'timestamp': execution_timestamp, 'symbol': self.symbol,
+            'type': order_type, 'side': side, 'price': execution_price, 'quantity': quantity_asset,
+            'commission': commission_this_trade, 'pnl': pnl_this_trade, 'balance': self.current_balance,
+            'entry_time_closed_pos': entry_time_of_closed_pos, # For duration calculation if needed
+            'value_closed_pos': closed_position_value # For calculating returns on closed parts
         }
         self.simulated_trades.append(trade_record)
-        self.logger.info(f"SIM TRADE: {side} {quantity_asset} {self.symbol} @ {execution_price:.2f}, Comm: {commission:.4f}, PnL: {pnl:.2f}, Bal: {self.current_balance:.2f}")
-        return trade_record
+        self.logger.info(f"SIM TRADE: {side} {quantity_asset:.4f} {self.symbol} @ {execution_price:.2f}, ClientOID: {client_order_id}, Comm: {commission_this_trade:.4f}, PnL: {pnl_this_trade:.2f}, Bal: {self.current_balance:.2f}")
+        return trade_record, pnl_this_trade, commission_this_trade
 
 
-    async def run_backtest(self):
+    async def run_backtest(self) -> Optional[Dict[str, Any]]:
         self.logger.info(f"Starting backtest for {self.symbol} from {self.start_date_str} to {self.end_date_str}")
-        if not await self._prepare_data() or self.historical_data is None:
-            self.logger.error("Backtest preparation failed. Aborting.")
-            return
+        if not await self._prepare_data() or self.historical_data is None or self.historical_data.empty:
+            self.logger.error("Backtest data preparation failed. Aborting."); return None
 
-        # The backtester itself acts as the order manager for the strategy during backtesting
         self.strategy_instance = self.strategy_class(
             strategy_id=f"backtest_{self.strategy_class.__name__}_{self.symbol}",
-            params=self.strategy_params,
-            order_manager=self, # Pass self (BacktestEngine) as the order_manager
-            market_data_provider=self.market_data_provider, # MDP might be used by strategy for other symbols or context
-            logger=self.logger
+            params=self.strategy_params, order_manager=self,
+            market_data_provider=self.market_data_provider,
+            risk_manager=self.risk_manager, logger=self.logger
         )
+        self.strategy_instance.set_backtest_mode(True)
+        await self.strategy_instance.start()
 
-        # Strategies in backtest mode should not try to make live subscriptions.
-        # The BaseStrategy or individual strategies might need a 'backtest_mode' flag or check.
-        if hasattr(self.strategy_instance, 'set_backtest_mode'):
-             self.strategy_instance.set_backtest_mode(True)
+        # Initial equity point already added in __init__
 
-        await self.strategy_instance.start() # Initialize strategy state
+        for kline_row_tuple in self.historical_data.itertuples():
+            self._current_kline_index = self.historical_data.index.get_loc(kline_row_tuple.Index)
+            current_timestamp_dt = kline_row_tuple.Index # This is pandas Timestamp
 
-        self.equity_curve.append({'timestamp': self.historical_data.index[0] - pd.Timedelta(seconds=1), 'balance': self.initial_capital}) # Initial equity point
+            kline_dict_from_row = kline_row_tuple._asdict()
+            kline_open_time_ms = int(current_timestamp_dt.timestamp() * 1000)
+            kline_interval_ms = self._KLINE_INTERVAL_MILLISECONDS.get(self.timeframe, 0)
+            kline_close_time_ms = kline_open_time_ms + kline_interval_ms - 1
 
-        for kline_row in self.historical_data.itertuples():
-            self._current_kline_index = self.historical_data.index.get_loc(kline_row.Index)
-            current_timestamp = kline_row.Index # This is already a pandas Timestamp (datetime like)
-
-            # Prepare kline_data in the format strategy expects (similar to WebSocket kline event)
-            kline_data_for_strategy = {
-                'e': 'kline',           # Event type
-                'E': int(current_timestamp.timestamp() * 1000 + self._KLINE_INTERVAL_MILLISECONDS[self.timeframe] -1), # Event time (approx kline close)
-                's': self.symbol,
-                'k': {
-                    't': int(current_timestamp.timestamp() * 1000),              # Kline start time
-                    'T': int(current_timestamp.timestamp() * 1000 + self._KLINE_INTERVAL_MILLISECONDS[self.timeframe] -1), # Kline close time
-                    's': self.symbol,
-                    'i': self.timeframe,
-                    'o': kline_row.open,
-                    'h': kline_row.high,
-                    'l': kline_row.low,
-                    'c': kline_row.close,
-                    'v': kline_row.volume,
-                    'n': kline_row.number_of_trades if 'number_of_trades' in kline_row._fields else 0, # Field name from df
-                    'x': True, # Kline is closed
-                    'q': kline_row.quote_asset_volume if 'quote_asset_volume' in kline_row._fields else 0.0,
-                    'V': kline_row.taker_buy_base_asset_volume if 'taker_buy_base_asset_volume' in kline_row._fields else 0.0,
-                    'Q': kline_row.taker_buy_quote_asset_volume if 'taker_buy_quote_asset_volume' in kline_row._fields else 0.0,
-                    'B': "0" # Ignore
-                }
+            kline_data_for_strategy_k_field = {
+                't': kline_open_time_ms, 'T': kline_close_time_ms, 's': self.symbol, 'i': self.timeframe,
+                'o': kline_dict_from_row.get('open'), 'h': kline_dict_from_row.get('high'),
+                'l': kline_dict_from_row.get('low'), 'c': kline_dict_from_row.get('close'),
+                'v': kline_dict_from_row.get('volume'),
+                'n': kline_dict_from_row.get('number_of_trades', 0), 'x': True,
+                'q': kline_dict_from_row.get('quote_asset_volume', 0.0),
+                'V': kline_dict_from_row.get('taker_buy_base_asset_volume', 0.0),
+                'Q': kline_dict_from_row.get('taker_buy_quote_asset_volume', 0.0), 'B': "0",
+                'atr': kline_dict_from_row.get('atr', 0.0) if not np.isnan(kline_dict_from_row.get('atr', np.nan)) else 0.0
             }
-            # Pass the 'k' dict as kline_data to on_kline_update, as per BaseStrategy hint
-            await self.strategy_instance.on_kline_update(self.symbol, self.timeframe, kline_data_for_strategy['k'])
+            await self.strategy_instance.on_kline_update(self.symbol, self.timeframe, kline_data_for_strategy_k_field)
 
-            # Record equity at the end of each bar (after strategy processing and potential trades)
-            self.equity_curve.append({'timestamp': current_timestamp, 'balance': self.current_balance})
+            simulated_mark_price_data = {
+                'e': 'markPriceUpdate', 's': self.symbol,
+                'p': str(kline_dict_from_row.get('close')),
+                'E': kline_close_time_ms
+            }
+            if hasattr(self.strategy_instance, 'on_mark_price_update'):
+                await self.strategy_instance.on_mark_price_update(self.symbol, simulated_mark_price_data)
+
+            self.equity_curve.append({'timestamp': current_timestamp_dt, 'balance': self.current_balance})
+            # Update peak equity for drawdown calculation
+            if self.current_balance > self._peak_equity:
+                self._peak_equity = self.current_balance
+            drawdown = (self._peak_equity - self.current_balance) / self._peak_equity if self._peak_equity > 0 else 0
+            if drawdown > self.max_drawdown: # Max drawdown is positive value
+                self.max_drawdown = drawdown
+
+
+        if not self.equity_curve or self.equity_curve[-1]['balance'] != self.current_balance : # Append final equity if loop didn't run or last state changed
+             self.equity_curve.append({'timestamp': self.historical_data.index[-1] if not self.historical_data.empty else pd.to_datetime(self.end_date_str, utc=True),
+                                   'balance': self.current_balance})
+
 
         await self.strategy_instance.stop()
-        self._calculate_and_log_performance_metrics()
+        performance_metrics = self._calculate_and_log_performance_metrics()
         self.logger.info("Backtest finished.")
-        return self.simulated_trades, self.equity_curve
+        return performance_metrics # Return metrics dict
 
 
-    def _calculate_and_log_performance_metrics(self):
-        if not self.simulated_trades:
-            self.logger.info("No trades were executed during the backtest.")
-            return
+    def _calculate_and_log_performance_metrics(self) -> Dict[str, Any]:
+        if not self.simulated_trades: self.logger.info("No trades executed."); return {}
 
-        total_pnl = self.current_balance - self.initial_capital
-        percent_return = (total_pnl / self.initial_capital) * 100
-        num_trades = len(self.simulated_trades)
+        # Total PnL and Return already calculated via self.current_balance
+        percent_return = (self.total_pnl / self.initial_capital) * 100 if self.initial_capital > 0 else 0
+        win_rate = (self.winning_trades / self.num_trades) * 100 if self.num_trades > 0 else 0
+        profit_factor = self.gross_profit / abs(self.gross_loss) if self.gross_loss != 0 else float('inf')
 
-        winning_trades = sum(1 for trade in self.simulated_trades if trade['pnl'] > 0)
-        losing_trades = sum(1 for trade in self.simulated_trades if trade['pnl'] < 0)
-        win_rate = (winning_trades / num_trades) * 100 if num_trades > 0 else 0
-
+        metrics = {
+            "initial_capital": self.initial_capital, "final_balance": self.current_balance,
+            "total_pnl": self.total_pnl, "percent_return": percent_return,
+            "num_trades": self.num_trades, "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades, "win_rate": win_rate,
+            "gross_profit": self.gross_profit, "gross_loss": abs(self.gross_loss),
+            "profit_factor": profit_factor, "max_drawdown": self.max_drawdown * 100 # As percentage
+        }
         self.logger.info("--- Backtest Performance Metrics ---")
-        self.logger.info(f"Initial Capital: {self.initial_capital:.2f}")
-        self.logger.info(f"Final Balance:   {self.current_balance:.2f}")
-        self.logger.info(f"Total P&L:       {total_pnl:.2f}")
-        self.logger.info(f"Percent Return:  {percent_return:.2f}%")
-        self.logger.info(f"Number of Trades:{num_trades}")
-        self.logger.info(f"Winning Trades:  {winning_trades}")
-        self.logger.info(f"Losing Trades:   {losing_trades}")
-        self.logger.info(f"Win Rate:        {win_rate:.2f}%")
-        # TODO: Max Drawdown, Sharpe Ratio, etc.
+        for key, value in metrics.items():
+            self.logger.info(f"{key.replace('_', ' ').title()}: {value:.2f}" if isinstance(value, float) else f"{key.replace('_', ' ').title()}: {value}")
+        return metrics
 
-    # --- Mock OrderManager Interface for Strategy ---
     async def place_new_order(self, symbol: str, side: str, ord_type: str, quantity: float,
                               price: Optional[float] = None, timeInForce: Optional[str] = None,
                               reduceOnly: Optional[bool] = None, newClientOrderId: Optional[str] = None,
-                              stopPrice: Optional[float] = None, positionSide: Optional[str] = None, **kwargs) -> Optional[Dict]:
+                              stopPrice: Optional[float] = None, positionSide: Optional[str] = None,
+                              origClientOrderId: Optional[str] = None, # Added for consistency, though newClientOrderId is preferred
+                              **kwargs) -> Optional[Dict]:
 
-        current_kline_data = self.historical_data.iloc[self._current_kline_index]
-        execution_timestamp = current_kline_data.name # This is the kline open time (Pandas Timestamp)
+        client_oid = newClientOrderId or self._generate_client_order_id(self.strategy_instance.strategy_id if self.strategy_instance else "backtest") # type: ignore
+        self.logger.info(f"[Backtest] Order Req: ClientOID={client_oid}, {side} {quantity} {symbol} Type:{ord_type} @ {price if price else 'MARKET'}")
 
-        # For backtesting, MARKET orders are filled at the close of the current bar.
-        # LIMIT orders would require more complex logic (checking if price hits in next bar, etc.)
         if ord_type.upper() == "MARKET":
-            execution_price = current_kline_data['close']
-            self.logger.info(f"[Backtest] Simulating MARKET {side} order for {quantity} {symbol} at {execution_price} (Close of current bar)")
+            if self._current_kline_index >= len(self.historical_data): # type: ignore
+                self.logger.error("[Backtest] No more kline data for MARKET order fill."); return None
 
-            simulated_fill_details = self._simulate_market_order(side, quantity, execution_price, execution_timestamp)
+            current_kline_data = self.historical_data.iloc[self._current_kline_index] # type: ignore
+            execution_price = float(current_kline_data['close'])
+            execution_timestamp = current_kline_data.name # This is pandas Timestamp
 
-            # Simulate Binance API response for a filled market order
+            sim_trade_details, pnl, commission = self._simulate_market_order(side, quantity, execution_price, execution_timestamp, client_oid, ord_type.upper(), price) # type: ignore
+
             response = {
-                'symbol': symbol,
-                'orderId': int(time.time() * 1000000), # Mock order ID
-                'clientOrderId': newClientOrderId or self._generate_client_order_id(),
+                'symbol': symbol, 'orderId': f"sim_{int(time.time_ns())}", 'clientOrderId': client_oid,
                 'transactTime': int(execution_timestamp.timestamp() * 1000),
-                'price': '0', # Market orders have price 0
-                'origQty': str(quantity),
-                'executedQty': str(quantity),
-                'cumQuote': str(simulated_fill_details['price'] * quantity), # Filled value
-                'status': 'FILLED',
-                'timeInForce': timeInForce or 'GTC', # Market orders are usually GTC or IOC/FOK
-                'type': 'MARKET',
-                'side': side,
-                'avgPrice': str(simulated_fill_details['price']),
-                'positionSide': positionSide or self.current_position.get('side') if self.current_position else 'BOTH',
-                # Include other fields as strategy might expect them from on_order_update
+                'price': '0', 'origQty': str(quantity), 'executedQty': str(quantity),
+                'cumQuote': str(execution_price * quantity), 'status': 'FILLED',
+                'timeInForce': timeInForce or 'GTC', 'type': 'MARKET', 'side': side,
+                'avgPrice': str(execution_price), 'reduceOnly': str(reduceOnly).lower() if reduceOnly is not None else None,
+                'stopPrice': str(stopPrice) if stopPrice else None,
+                'workingType': kwargs.get('workingType', 'CONTRACT_PRICE'),
+                'positionSide': positionSide or (self.current_position['side'] if self.current_position else 'BOTH'),
+                'rp': str(pnl) # Realized profit for this trade
             }
-            # Simulate calling strategy's on_order_update
             if self.strategy_instance:
-                # Structure for ORDER_TRADE_UPDATE event
-                order_update_event = {'e': 'ORDER_TRADE_UPDATE', 'T': response['transactTime'], 'E': response['transactTime'], 'o': response}
-                await self.strategy_instance.on_order_update(order_update_event['o'])
+                 await self.strategy_instance.on_order_update({'e': 'ORDER_TRADE_UPDATE', 'o': response})
             return response
-        else:
-            self.logger.warning(f"[Backtest] Order type '{ord_type}' not fully simulated. Only MARKET orders are processed for fill.")
-            # Return a PENDING_NEW like status or None
-            return {
-                'symbol': symbol, 'orderId': int(time.time() * 1000000), 'clientOrderId': newClientOrderId or self._generate_client_order_id(),
+        else: # LIMIT, STOP_MARKET etc.
+            self.logger.warning(f"[Backtest] Order type '{ord_type}' not fully simulated for fill. Returning as NEW.")
+            # For backtesting, we might want to simulate limit order fills based on H/L prices of subsequent bars.
+            # For now, just acknowledge it.
+            current_kline_ts = self.historical_data.iloc[self._current_kline_index].name # type: ignore
+            response = {
+                'symbol': symbol, 'orderId': f"sim_{int(time.time_ns())}", 'clientOrderId': client_oid,
                 'status': 'NEW', 'type': ord_type, 'side': side, 'price': str(price), 'origQty': str(quantity),
+                'transactTime': int(current_kline_ts.timestamp() * 1000), # type: ignore
                 # ... other typical fields for a NEW order
             }
+            if self.strategy_instance:
+                await self.strategy_instance.on_order_update({'e': 'ORDER_TRADE_UPDATE', 'o': response})
+            return response
 
-    async def cancel_existing_order(self, symbol: str, orderId: Optional[int] = None,
+    async def cancel_existing_order(self, symbol: str, orderId: Optional[str] = None,  # orderId can be string from sim
                                     origClientOrderId: Optional[str] = None, **kwargs) -> Optional[Dict]:
-        log_id = orderId if orderId else origClientOrderId
-        self.logger.info(f"[Backtest] Strategy requests to cancel order: ID={log_id} for {symbol}")
-        # In this simplified backtester, non-MARKET orders aren't really "active" to be cancelled.
-        # If we were simulating limit orders, we'd check a list of pending simulated orders.
-        # For now, assume cancellation is successful if the order was (theoretically) placed.
-        return {
-            'symbol': symbol, 'orderId': orderId, 'clientOrderId': origClientOrderId,
-            'status': 'CANCELED', # Simulate successful cancellation
-            # ... other fields
-        }
-
-# Example Dummy Strategy for testing BacktestEngine
-class DummyBacktestStrategy(BaseStrategy):
-    async def start(self):
-        await super().start() # Important for base class logging
-        self.logger.info(f"{self.strategy_id} started with params: {self.params}")
-        # In a real strategy, you might initialize indicators or subscribe to data (not for backtest)
-        self.long_ma_period = self.get_param('long_ma_period', 20)
-        self.short_ma_period = self.get_param('short_ma_period', 5)
-        self.trade_quantity = self.get_param('trade_quantity', 0.001)
-        self.klines_buffer = pd.DataFrame()
-
-
-    async def on_kline_update(self, symbol: str, interval: str, kline_data: Dict):
-        # self.logger.debug(f"{self.strategy_id} kline: {kline_data['c']}")
-        # Append new kline to buffer
-        new_kline = pd.Series({
-            'open': float(kline_data['o']),
-            'high': float(kline_data['h']),
-            'low': float(kline_data['l']),
-            'close': float(kline_data['c']),
-            'volume': float(kline_data['v'])
-        }, name=pd.to_datetime(kline_data['t'], unit='ms', utc=True))
-
-        # self.klines_buffer = self.klines_buffer.append(new_kline) # .append is deprecated
-        self.klines_buffer = pd.concat([self.klines_buffer, new_kline.to_frame().T])
-
-
-        if len(self.klines_buffer) > self.long_ma_period:
-            self.klines_buffer['short_ma'] = self.klines_buffer['close'].rolling(window=self.short_ma_period).mean()
-            self.klines_buffer['long_ma'] = self.klines_buffer['close'].rolling(window=self.long_ma_period).mean()
-
-            if len(self.klines_buffer) < 2: return # Need at least 2 points to check crossover
-
-            # MA Crossover Logic
-            # short_ma_prev = self.klines_buffer['short_ma'].iloc[-2]
-            # long_ma_prev = self.klines_buffer['long_ma'].iloc[-2]
-            # short_ma_curr = self.klines_buffer['short_ma'].iloc[-1]
-            # long_ma_curr = self.klines_buffer['long_ma'].iloc[-1]
-
-            # Simplified: access last two values if available
-            if len(self.klines_buffer) < self.long_ma_period + 1: return
-
-            short_ma_prev, short_ma_curr = self.klines_buffer['short_ma'].iloc[-2:]
-            long_ma_prev, long_ma_curr = self.klines_buffer['long_ma'].iloc[-2:]
-
-
-            # Access current position from BacktestEngine (which is self.order_manager here)
-            current_position_side = self.order_manager.current_position['side'] if self.order_manager.current_position else None
-
-            if short_ma_curr > long_ma_curr and short_ma_prev <= long_ma_prev: # Bullish crossover
-                if current_position_side != 'LONG':
-                    if current_position_side == 'SHORT': # Close short first
-                        await self.order_manager.place_new_order(symbol, "BUY", "MARKET", self.order_manager.current_position['quantity'], strategy_id=self.strategy_id)
-                    await self.order_manager.place_new_order(symbol, "BUY", "MARKET", self.trade_quantity, strategy_id=self.strategy_id)
-                    self.logger.info(f"{self.strategy_id}: Bullish crossover. Placed BUY order.")
-            elif short_ma_curr < long_ma_curr and short_ma_prev >= long_ma_prev: # Bearish crossover
-                if current_position_side != 'SHORT':
-                    if current_position_side == 'LONG': # Close long first
-                         await self.order_manager.place_new_order(symbol, "SELL", "MARKET", self.order_manager.current_position['quantity'], strategy_id=self.strategy_id)
-                    await self.order_manager.place_new_order(symbol, "SELL", "MARKET", self.trade_quantity, strategy_id=self.strategy_id)
-                    self.logger.info(f"{self.strategy_id}: Bearish crossover. Placed SELL order.")
-
-    async def on_depth_update(self, symbol: str, depth_data: Dict): pass
-    async def on_trade_update(self, symbol: str, trade_data: Dict): pass
-    async def on_mark_price_update(self, symbol: str, mark_price_data: Dict): pass
-    async def on_order_update(self, order_update: Dict):
-        self.logger.info(f"{self.strategy_id} received order update in strategy: ClientOrderID: {order_update.get('c')}, Status: {order_update.get('X')}")
-    async def stop(self):
-        await super().stop()
+        log_id = orderId or origClientOrderId
+        self.logger.info(f"[Backtest] Cancel Order Req: ID={log_id} for {symbol}")
+        # In a more complex backtester, we'd check a list of pending (simulated) limit orders.
+        # Here, we just simulate a successful cancellation acknowledgement.
+        current_kline_ts = self.historical_data.iloc[self._current_kline_index].name # type: ignore
+        response = {'symbol': symbol, 'orderId': orderId, 'origClientOrderId': origClientOrderId, 'clientOrderId': origClientOrderId,
+                    'status': 'CANCELED', 'type': kwargs.get('type', 'LIMIT'), # Guess type if not provided
+                    'side': kwargs.get('side', 'UNKNOWN'),
+                    'transactTime': int(current_kline_ts.timestamp() * 1000)} # type: ignore
+        if self.strategy_instance:
+            await self.strategy_instance.on_order_update({'e': 'ORDER_TRADE_UPDATE', 'o': response})
+        return response
 
 
 if __name__ == '__main__':
-    import os
-    from dotenv import load_dotenv
-    try:
-        from bot.core.logger_setup import setup_logger
-        from bot.connectors.binance_connector import BinanceAPI # For MDP
-    except ImportError:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        logger = logging.getLogger('algo_trader_bot_test_backtester')
-
-
-    dotenv_path = os.path.join(os.path.dirname(__file__), '../../.env') # Adjust if .env is elsewhere
-    load_dotenv(dotenv_path=dotenv_path)
-
-    logger = logging.getLogger('algo_trader_bot')
-    if not logger.handlers:
-        log_level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
-        log_level_int = getattr(logging, log_level_str, logging.INFO)
-        try: setup_logger(level=log_level_int, log_file="backtester_test.log")
-        except NameError: logging.basicConfig(level=log_level_int)
-
-
-    API_KEY_TEST = os.getenv("BINANCE_TESTNET_API_KEY")
-    API_SECRET_TEST = os.getenv("BINANCE_TESTNET_API_SECRET")
-
-    if not API_KEY_TEST or API_KEY_TEST == "YOUR_TESTNET_API_KEY":
-        logger.error("Testnet API keys not found in .env. Backtester test for data fetching might fail.")
-        # For backtesting that only needs historical data, API keys might not be strictly needed
-        # if get_historical_klines doesn't enforce signed requests for public data.
-        # However, BinanceAPI class requires it for header setup.
-        # We can proceed if MDP can fetch data without full auth.
-        mock_connector = None # Or a BinanceAPI instance with no keys if it allows public calls
-    else:
-        mock_connector = BinanceAPI(api_key=API_KEY_TEST, api_secret=API_SECRET_TEST, testnet=True)
-
-
-    async def run_test():
-        if not mock_connector:
-            logger.warning("Mock connector not available, full backtest might not run if data fetching needs auth.")
-            # Create a dummy connector if real one fails, to test logic flow
-            class DummyConnector:
-                def get_klines(self, **kwargs): return [] # Returns empty list
-            mdp = MarketDataProvider(binance_connector=DummyConnector()) # type: ignore
-        else:
-            mdp = MarketDataProvider(binance_connector=mock_connector)
-
-        strategy_params = {'long_ma_period': 10, 'short_ma_period': 3, 'trade_quantity': 0.002} # Shorter MAs for more trades
-
-        backtester = BacktestEngine(
-            market_data_provider=mdp,
-            strategy_class=DummyBacktestStrategy,
-            strategy_params=strategy_params,
-            start_date_str="2023-12-01", # Use a short recent period for testing
-            end_date_str="2023-12-05",
-            initial_capital=1000.0,
-            symbol="BTCUSDT",
-            timeframe="1h" # Use 1h to have fewer data points for quick test
-        )
-
-        await backtester.run_backtest()
-
-        logger.info("\n--- Simulated Trades ---")
-        for trade in backtester.simulated_trades:
-            logger.info(trade)
-
-        # logger.info("\n--- Equity Curve ---")
-        # for point in backtester.equity_curve:
-        #     logger.info(point)
-
-    if mock_connector or True: # Allow running even if real connector init failed, with DummyConnector
-        asyncio.run(run_test())
-    else:
-        logger.error("Cannot run backtest example without API keys for MarketDataProvider.")
+    # ... (main test block from previous step, ensure DummyBacktestStrategy is defined or imported) ...
+    # Note: The DummyBacktestStrategy needs to be adapted to use the new async RiskManager methods
+    # and the more detailed kline_data and order_update formats.
+    # For this step, the focus is on BacktestEngine structure.
+    # The __main__ block from previous step can be used as a template but might need adjustments
+    # to reflect that RiskManager is now internal to BacktestEngine and strategies get it via constructor.
+    pass # Keeping __main__ simple for now, focus on class implementation.
 
 ```
