@@ -23,6 +23,7 @@ TA-Lib # IMPORTANT for Windows: Installation can be tricky.
 
 # Graphical User Interface (GUI)
 PySide6 # For the GUI components (alternative to PyQt5, more liberal license)
+pyqtgraph>=0.12 # For charting capabilities
 
 # Other useful utilities
 # (Add any other general-purpose libraries here as needed)
