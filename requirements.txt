@@ -1,0 +1,31 @@
+# Binance API and Core Trading Libraries
+binance-futures-connector-python
+pandas
+numpy
+requests
+websockets # For direct WebSocket interactions if needed, or as a dependency
+python-dotenv # For managing environment variables (API keys, etc.)
+
+# Technical Analysis Library
+TA-Lib # IMPORTANT for Windows: Installation can be tricky.
+       # Requires the TA-Lib C library to be installed.
+       # If 'pip install TA-Lib' fails, you might need to:
+       # 1. Download a pre-compiled .whl file for your Python version and Windows architecture
+       #    (e.g., from Christoph Gohlke's Unofficial Windows Binaries for Python Extension Packages:
+       #     https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib)
+       #    and then 'pip install TA_Lib-XYZ-cpXY-cpXYm-win_amd64.whl'.
+       # 2. Or, install Microsoft Visual C++ Build Tools and ensure the TA-Lib C library
+       #    is correctly installed and discoverable by the compiler.
+       #    (Download C library from https://ta-lib.org/hdr_dw.html and follow instructions)
+       # 3. Alternatively, consider using Conda:
+       #    'conda install -c conda-forge libta-lib'
+       #    'conda install -c conda-forge ta-lib'
+
+# Graphical User Interface (GUI)
+PySide6 # For the GUI components (alternative to PyQt5, more liberal license)
+
+# Other useful utilities
+# (Add any other general-purpose libraries here as needed)
+# Example: scikit-learn (if machine learning based strategies are explored later)
+# Example: matplotlib (for plotting, if GUI doesn't cover all needs or for backtesting reports)
+# Example: jupyter (for research and strategy development)
