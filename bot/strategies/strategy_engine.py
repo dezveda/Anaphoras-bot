@@ -2,42 +2,39 @@ import logging
 import asyncio
 from typing import Dict, Type, Any, Optional
 
-# Assuming BaseStrategy, OrderManager, MarketDataProvider will be correctly imported
-# when the whole 'bot' package is structured.
 try:
     from bot.strategies.base_strategy import BaseStrategy
     from bot.core.order_executor import OrderManager
     from bot.core.data_fetcher import MarketDataProvider
-except ImportError: # Fallback for potential local test scenarios or path issues
+    from bot.core.risk_manager import BasicRiskManager # Import BasicRiskManager
+except ImportError:
     from .base_strategy import BaseStrategy
-    # Adjust path if core is not directly accessible like this in tests
-    # This might require more robust path handling in a real test setup
     import sys, os
     sys.path.append(os.path.join(os.path.dirname(__file__), '../core'))
-    from order_executor import OrderManager
-    from data_fetcher import MarketDataProvider
+    from order_executor import OrderManager # type: ignore
+    from data_fetcher import MarketDataProvider # type: ignore
+    from risk_manager import BasicRiskManager # type: ignore
 
 
 class StrategyEngine:
     def __init__(self,
                  order_manager: OrderManager,
                  market_data_provider: MarketDataProvider,
+                 risk_manager: BasicRiskManager, # Added risk_manager
                  logger_name: str = 'algo_trader_bot'):
         self.order_manager = order_manager
         self.market_data_provider = market_data_provider
+        self.risk_manager = risk_manager # Store risk_manager
         self.logger = logging.getLogger(logger_name)
 
         self.strategies: Dict[str, BaseStrategy] = {}
-        # self.strategy_tasks: Dict[str, asyncio.Task] = {} # For managing async tasks of strategies if needed
 
-        # Register with MarketDataProvider to receive user data (especially order updates)
-        # This callback will then distribute to relevant strategies.
+        # Register _distribute_order_update_to_strategies with MarketDataProvider
+        # This method will be called by MDP when any user data event occurs.
         self.market_data_provider.subscribe_to_user_data(
-            general_user_data_callback=None, # Or a generic handler if needed
-            order_update_callback=self._distribute_order_update_to_strategies
+            user_data_event_callback=self._distribute_user_data_to_strategies
         )
-        self.logger.info("StrategyEngine initialized and subscribed to order updates from MarketDataProvider.")
-
+        self.logger.info("StrategyEngine initialized and subscribed to user data events from MarketDataProvider.")
 
     def load_strategy(self,
                       strategy_class: Type[BaseStrategy],
@@ -48,13 +45,13 @@ class StrategyEngine:
             return False
 
         try:
-            # Pass the shared logger instance to the strategy
             strategy_instance = strategy_class(
                 strategy_id=strategy_id,
                 params=params,
                 order_manager=self.order_manager,
                 market_data_provider=self.market_data_provider,
-                logger=self.logger # Pass the engine's logger or a child logger
+                risk_manager=self.risk_manager, # Pass risk_manager to strategy
+                logger=self.logger
             )
             self.strategies[strategy_id] = strategy_instance
             self.logger.info(f"Strategy '{strategy_id}' of type {strategy_class.__name__} loaded successfully.")
@@ -64,6 +61,7 @@ class StrategyEngine:
             return False
 
     async def start_strategy(self, strategy_id: str):
+        # ... (rest of the method remains the same)
         if strategy_id not in self.strategies:
             self.logger.error(f"Cannot start strategy '{strategy_id}': Not found.")
             return
@@ -75,13 +73,14 @@ class StrategyEngine:
 
         self.logger.info(f"Starting strategy '{strategy_id}'...")
         try:
-            await strategy.start() # Strategy's start method should handle its subscriptions
+            await strategy.start()
             self.logger.info(f"Strategy '{strategy_id}' started successfully.")
         except Exception as e:
             self.logger.error(f"Error starting strategy '{strategy_id}': {e}", exc_info=True)
-            strategy.is_active = False # Ensure it's marked as inactive on error
+            strategy.is_active = False
 
     async def stop_strategy(self, strategy_id: str):
+        # ... (rest of the method remains the same)
         if strategy_id not in self.strategies:
             self.logger.error(f"Cannot stop strategy '{strategy_id}': Not found.")
             return
@@ -93,7 +92,7 @@ class StrategyEngine:
 
         self.logger.info(f"Stopping strategy '{strategy_id}'...")
         try:
-            await strategy.stop() # Strategy's stop method should handle unsubscriptions
+            await strategy.stop()
             self.logger.info(f"Strategy '{strategy_id}' stopped successfully.")
         except Exception as e:
             self.logger.error(f"Error stopping strategy '{strategy_id}': {e}", exc_info=True)
@@ -110,175 +109,116 @@ class StrategyEngine:
     async def stop_all_strategies(self):
         self.logger.info("Stopping all active strategies...")
         for strategy_id in self.strategies.keys():
-            if self.strategies[strategy_id].is_active:
+            if self.strategies[strategy_id].is_active: # Check if strategy is active before stopping
                 await self.stop_strategy(strategy_id)
         self.logger.info("Finished attempting to stop all strategies.")
 
-    def _distribute_order_update_to_strategies(self, order_update_data: Dict):
+    def _distribute_user_data_to_strategies(self, user_data_event: Dict):
         """
-        Callback for MarketDataProvider's user data stream, specifically for order updates.
-        It distributes the order update to all active strategies.
+        Callback for MarketDataProvider's user data stream.
+        It distributes relevant events (like ORDER_TRADE_UPDATE) to all active strategies.
         """
-        # This method is called by MarketDataProvider (from a thread)
-        # It needs to schedule the async on_order_update method for each strategy
-        self.logger.debug(f"StrategyEngine distributing order update: {order_update_data.get('c', order_update_data.get('i'))}")
+        event_type = user_data_event.get('e')
+        if event_type == 'ORDER_TRADE_UPDATE':
+            order_data = user_data_event.get('o', {}) # Actual order data is in 'o' field
+            self.logger.debug(f"StrategyEngine distributing ORDER_TRADE_UPDATE: ClientOrderID={order_data.get('c')}, OrderID={order_data.get('i')}")
 
-        # Strategies are responsible for filtering if the update is relevant to them
-        for strategy_id, strategy_instance in self.strategies.items():
-            if strategy_instance.is_active:
-                self.logger.debug(f"Forwarding order update to strategy: {strategy_id}")
-                # Use asyncio.create_task if called from an async context,
-                # or ensure the strategy's on_order_update is thread-safe / uses run_coroutine_threadsafe
-                # For now, assuming this callback itself might not be in an asyncio loop,
-                # we might need a way to run the async strategy methods.
-                # This is a common challenge with mixed sync/async code.
-                # If StrategyEngine methods like start/stop are run in an asyncio loop,
-                # then we can use asyncio.create_task.
-                # For simplicity now, let's assume the callback should schedule the async method.
-                # This part might need an asyncio loop running in the StrategyEngine or main application.
-                # For now, let's just call it directly if it were synchronous or handle the async call appropriately.
-
-                # A simple way for now (if an event loop is running in the thread that calls this):
-                # asyncio.create_task(strategy_instance.on_order_update(order_update_data))
-                # However, MarketDataProvider's user stream callback is run in a sync thread.
-                # So, we'd need to use `asyncio.run_coroutine_threadsafe` if strategies are truly async
-                # and an event loop is running in the main thread or a dedicated asyncio thread.
-                # For now, let's log a placeholder. This needs robust async handling.
-                self.logger.info(f"Placeholder: Strategy {strategy_id} would process order update (async call needed).")
-                # In a full async app, this would be:
-                # loop = asyncio.get_event_loop() # Or a specific loop
-                # asyncio.run_coroutine_threadsafe(strategy_instance.on_order_update(order_update_data), loop)
-
-
-    # Example of how strategies might ask the engine to subscribe them to data
-    # This is generally better handled within the strategy's start() method itself.
-    # async def request_market_data_subscription(self, strategy_id: str, symbol: str, data_type: str, interval: Optional[str] = None):
-    #     strategy = self.strategies.get(strategy_id)
-    #     if not strategy:
-    #         self.logger.error(f"Strategy {strategy_id} not found for data subscription.")
-    #         return
-
-    #     self.logger.info(f"Strategy {strategy_id} requesting {data_type} for {symbol}@{interval if interval else ''}")
-    #     if data_type == "kline":
-    #         if not interval: self.logger.error("Interval required for kline subscription"); return
-    #         # The lambda now correctly captures symbol and interval for this specific subscription
-    #         await self.market_data_provider.subscribe_to_kline_stream(
-    #             symbol, interval,
-    #             lambda k_data, s=symbol, i=interval: asyncio.create_task(strategy.on_kline_update(s, i, k_data))
-    #         )
-    #     # Add other data types (depth, trade, etc.)
-    #     else:
-    #         self.logger.warning(f"Data type {data_type} not yet supported for direct engine subscription.")
+            for strategy_id, strategy_instance in self.strategies.items():
+                if strategy_instance.is_active:
+                    self.logger.debug(f"Forwarding order update to strategy: {strategy_id}")
+                    # Schedule the async on_order_update method.
+                    # This assumes an event loop is running in the thread where this callback is executed,
+                    # or that the strategy's on_order_update can handle being called from a sync context
+                    # if it needs to interact with an asyncio loop (e.g., using asyncio.run_coroutine_threadsafe).
+                    # Since MarketDataProvider's user stream runs in a thread that starts its own asyncio loop
+                    # for websockets.connect, and this callback is called from there, we can use create_task.
+                    try:
+                        # This is tricky. The callback from MDP is sync. The strategy method is async.
+                        # We need to ensure there's an event loop available for create_task.
+                        # The thread started by BinanceConnector for user stream runs an asyncio loop.
+                        # This should work if this method is called from that thread's loop.
+                        asyncio.create_task(strategy_instance.on_order_update(order_data))
+                    except RuntimeError as e:
+                        self.logger.error(f"RuntimeError creating task for strategy {strategy_id} on_order_update (is an event loop running in this thread?): {e}")
+                        # Fallback or alternative: schedule via a known loop if available
+                        # main_loop = asyncio.get_main_loop() # This might not be the right loop
+                        # if main_loop.is_running():
+                        #    asyncio.run_coroutine_threadsafe(strategy_instance.on_order_update(order_data), main_loop)
+                        # else:
+                        #    self.logger.error("No running event loop found to schedule strategy.on_order_update")
+        # Can add handling for other user data events like ACCOUNT_UPDATE if strategies need them directly
 
 
 if __name__ == '__main__':
-    # This is a very basic test, assuming other components are available and configured.
-    # In a real application, these would be initialized and managed by a main bot class.
-
-    # Setup basic logging for the test
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s')
     logger = logging.getLogger('algo_trader_bot')
 
-    # Mock objects for dependencies (replace with actual instances in a real app)
+    # --- Mock Objects ---
     class MockBinanceConnector:
         def __init__(self, api_key=None, api_secret=None, testnet=False):
-            self.user_data_control_flag = {} # Simulate this attribute
+            self.user_data_control_flag = {}
             self.logger = logging.getLogger('algo_trader_bot.MockConnector')
-        def start_user_stream(self, callback): self.logger.info("Mock User Stream Started."); return True
-        def stop_user_stream(self): self.logger.info("Mock User Stream Stopped.")
-        def start_market_stream(self, stream_names, callback): self.logger.info(f"Mock Market Stream {stream_names} Started."); return "mock_stream_id"
-        def stop_market_stream(self, stream_id): self.logger.info(f"Mock Market Stream {stream_id} Stopped.")
-
+        async def get_account_balance(self): return [{'asset': 'USDT', 'availableBalance': '10000.0'}]
+        def start_user_stream(self, callback): self.logger.info("Mock User Stream Started."); self.user_data_control_flag['keep_running'] = True; return True
+        def stop_user_stream(self): self.logger.info("Mock User Stream Stopped."); self.user_data_control_flag['keep_running'] = False
+        async def place_order(self, **kwargs): self.logger.info(f"Mock Place Order: {kwargs}"); return {"status": "NEW", "orderId": 123, "clientOrderId": kwargs.get("newClientOrderId")}
+        # Add other async methods if strategies call them directly via order_manager
 
     class MockMarketDataProvider:
         def __init__(self, connector):
             self.binance_connector = connector
             self.logger = logging.getLogger('algo_trader_bot.MockMDP')
-            self.user_data_callbacks = [] # Simulate this
+            self.user_data_event_callbacks = []
+        def subscribe_to_user_data(self, user_data_event_callback: Callable):
+            if user_data_event_callback:
+                self.user_data_event_callbacks.append(user_data_event_callback)
+                self.logger.info(f"MockMDP: Registered user data event callback: {user_data_event_callback.__name__}")
+            self.binance_connector.start_user_stream(self._internal_user_data_handler)
+        def _internal_user_data_handler(self, data): # Simulates connector calling this
+            for cb in self.user_data_event_callbacks: cb(data)
+        async def subscribe_to_kline_stream(self, symbol, interval, callback): self.logger.info(f"MockMDP: Kline stream for {symbol} {interval} registered.")
 
-        def subscribe_to_user_data(self, general_user_data_callback=None, order_update_callback=None):
-            if order_update_callback:
-                self.user_data_callbacks.append(order_update_callback) # Simplified for test
-                self.logger.info(f"MDP: Registered order update callback: {order_update_callback.__name__}")
-            # Simulate starting the stream in connector
-            self.binance_connector.start_user_stream(self._handle_mock_user_data)
+    class MockRiskManager:
+        def __init__(self, balance_provider): self.logger = logging.getLogger('algo_trader_bot.MockRM')
+        async def calculate_position_size_usd(self, **kwargs): return 100.0 # Fixed USD size
+        def calculate_quantity_from_risk_usd(self, **kwargs): return 0.001 # Fixed quantity
+        async def validate_order_risk(self, **kwargs): return True # Always valid
 
-        def _handle_mock_user_data(self, data): # This is what connector's user stream would call
-            for cb in self.user_data_callbacks:
-                cb(data)
-
-        async def subscribe_to_kline_stream(self, symbol, interval, callback):
-            self.logger.info(f"Mock MDP: Subscribed to kline {symbol} {interval}")
-            # In real scenario, would use self.binance_connector.start_market_stream
-            # and register the callback (passed to _handle_market_message which then calls strategy's on_kline_update)
-            pass # For this test, strategy's start will just log.
-
-    # Dummy Strategy for testing
-    class MyTestStrategy(BaseStrategy):
-        async def on_kline_update(self, symbol: str, interval: str, kline_data: Dict):
-            self.logger.info(f"{self.strategy_id}: Received kline for {symbol}@{interval}: C={kline_data.get('c')}")
+    class MyAsyncTestStrategy(BaseStrategy):
+        async def on_kline_update(self, symbol: str, interval: str, kline_data: Dict): self.logger.info(f"{self.strategy_id} Kline: {kline_data.get('c')}")
         async def on_depth_update(self, symbol: str, depth_data: Dict): pass
         async def on_trade_update(self, symbol: str, trade_data: Dict): pass
         async def on_mark_price_update(self, symbol: str, mark_price_data: Dict): pass
-        async def on_order_update(self, order_update: Dict):
-            self.logger.info(f"{self.strategy_id}: Received order update: {order_update.get('c')}, Status: {order_update.get('X')}")
-        async def start(self):
-            await super().start() # Call base start
-            self.logger.info(f"{self.strategy_id} specific start logic. Subscribing to data...")
-            # Example: self.market_data_provider.subscribe_to_kline_stream("BTCUSDT", "1m", self.on_kline_update)
-            # For this test, we'll assume subscriptions are managed via MarketDataProvider methods called here.
-            # The lambda structure in the original plan for StrategyEngine._subscribe_strategy_to_data
-            # is a good way to ensure the strategy's methods are correctly called.
-            # Here, we'll just log.
-            self.logger.info(f"{self.strategy_id} would subscribe to BTCUSDT@kline_1m now.")
-            # await self.market_data_provider.subscribe_to_kline_stream(
-            #     "BTCUSDT", "1m",
-            #     lambda data: asyncio.create_task(self.on_kline_update("BTCUSDT", "1m", data)) # Correct async call
-            # )
+        async def on_order_update(self, order_update: Dict): self.logger.info(f"{self.strategy_id} Order Update: {order_update.get('c')} -> {order_update.get('X')}")
+        async def start(self): await super().start(); self.logger.info(f"{self.strategy_id} started. Params: {self.params}")
+        async def stop(self): await super().stop(); self.logger.info(f"{self.strategy_id} stopped.")
 
-        async def stop(self):
-            await super().stop() # Call base stop
-            self.logger.info(f"{self.strategy_id} specific stop logic. Unsubscribing...")
+    async def main_engine_test():
+        connector = MockBinanceConnector()
+        mdp = MockMarketDataProvider(connector)
+        # OrderManager now expects risk_manager. For this test, can pass a mock.
+        # OrderManager's get_available_trading_balance is async.
+        order_manager = OrderManager(connector, mdp, risk_manager=None) # type: ignore
 
+        # RiskManager needs an async balance provider. OrderManager.get_available_trading_balance is now async.
+        risk_manager = MockRiskManager(order_manager.get_available_trading_balance) # type: ignore
+        order_manager.risk_manager = risk_manager # Assign it back if needed, or pass in constructor
 
-    async def main_test():
-        mock_connector = MockBinanceConnector()
-        mock_mdp = MockMarketDataProvider(mock_connector)
+        engine = StrategyEngine(order_manager, mdp, risk_manager) # Pass RM here
+        engine.load_strategy(MyAsyncTestStrategy, "strat1", {"symbol": "BTCUSDT", "some_param": 50})
 
-        # OrderManager needs a real connector for most ops, but for this test,
-        # we are focusing on StrategyEngine interaction with order updates.
-        # We can pass the mock_connector to OrderManager for limited testing.
-        mock_order_manager = OrderManager(mock_connector, mock_mdp) # type: ignore
+        await engine.start_all_strategies()
 
-        engine = StrategyEngine(mock_order_manager, mock_mdp)
+        logger.info("Simulating order update from MDP to Engine...")
+        mock_order_event = {"e": "ORDER_TRADE_UPDATE", "o": {"c": "client_order_id_test", "X": "FILLED", "s": "BTCUSDT"}}
+        # Simulate MDP's internal callback calling engine's callback
+        # This is how StrategyEngine gets user data events
+        engine._distribute_user_data_to_strategies(mock_order_event)
 
-        engine.load_strategy(MyTestStrategy, "test_strat_01", {"param1": 10, "symbol": "BTCUSDT"})
-
-        await engine.start_strategy("test_strat_01")
-
-        # Simulate an order update coming from MarketDataProvider (which got it from BinanceConnector user stream)
-        logger.info("\nSimulating an order update distribution...")
-        mock_order_event_data = {
-            "e": "ORDER_TRADE_UPDATE",
-            "T": time.time() * 1000,
-            "E": time.time() * 1000,
-            "o": {
-                "s": "BTCUSDT",
-                "c": "test_client_id_123", # clientOrderId
-                "i": 12345, # orderId
-                "X": "NEW", # status
-                "x": "NEW", # execution type
-                # ... other fields
-            }
-        }
-        # This callback is registered by StrategyEngine with MDP
-        engine._distribute_order_update_to_strategies(mock_order_event_data['o'])
-
-        await asyncio.sleep(2) # Give time for logs
-
-        await engine.stop_strategy("test_strat_01")
+        await asyncio.sleep(1)
+        await engine.stop_all_strategies()
 
     if __name__ == '__main__':
-        asyncio.run(main_test())
+        asyncio.run(main_engine_test())
 
 ```
