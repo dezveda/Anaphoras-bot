@@ -55,6 +55,8 @@ class ChartView(QWidget):
 
         self._init_ui()
         self._connect_signals()
+        self.candlestick_data_for_plotting: List[Dict[str, Any]] = []
+        self.current_chart_symbol_tf: Optional[Tuple[str, str]] = None
         # self.load_initial_chart_data() # Called from gui_launcher after window is shown
 
     def _init_ui(self):
@@ -120,6 +122,9 @@ class ChartView(QWidget):
         self.plot_widget_layout.ci.layout.setRowStretchFactor(0, 3) # Price plot takes 3/4 of space
         self.plot_widget_layout.ci.layout.setRowStretchFactor(1, 1) # RSI plot takes 1/4 of space
 
+        self.chart_status_label = QLabel("Load chart data.") # Status label for chart
+        self.main_layout.addWidget(self.chart_status_label, 0, Qt.AlignmentFlag.AlignCenter)
+
 
     def _connect_signals(self):
         self.load_chart_button.clicked.connect(self.handle_load_refresh_chart)
@@ -157,64 +162,177 @@ class ChartView(QWidget):
         # ... (implementation from previous step)
         if not self.backend_controller or not hasattr(self.backend_controller, 'get_historical_klines_for_chart'):
             self.logger.warning("Backend controller not available for chart data."); self.update_chart_data(pd.DataFrame(), self.timeframe_combo.currentText()); return
+
         symbol = "BTCUSDT"; timeframe = self.timeframe_combo.currentText()
+        self.current_chart_symbol_tf = (symbol, timeframe) # Store current chart focus
+        self.chart_status_label.setText(f"Loading {symbol} {timeframe}...")
         self.logger.info(f"Loading chart: {symbol} {timeframe}...")
+
         async def fetch_and_update():
             try:
-                df = await self.backend_controller.get_historical_klines_for_chart(symbol, timeframe, limit=200) # Fetch more for indicators
+                df = await self.backend_controller.get_historical_klines_for_chart(symbol, timeframe, limit=200)
                 self.update_chart_data(df if df is not None else pd.DataFrame(), timeframe)
-            except Exception as e: self.logger.error(f"Error fetching/updating chart: {e}", exc_info=True); self.update_chart_data(pd.DataFrame(),timeframe)
+                # After historical data is loaded and plotted, subscribe to live updates
+                if hasattr(self.backend_controller, 'subscribe_to_chart_klines'):
+                    await self.backend_controller.subscribe_to_chart_klines(symbol, timeframe)
+                self.chart_status_label.setText(f"Displaying {symbol} {timeframe} - Live")
+            except Exception as e:
+                self.logger.error(f"Error fetching/updating chart: {e}", exc_info=True)
+                self.update_chart_data(pd.DataFrame(), timeframe)
+                self.chart_status_label.setText(f"Error loading {symbol} {timeframe}")
+
         if self.backend_controller.loop and self.backend_controller.loop.is_running(): # type: ignore
             asyncio.create_task(fetch_and_update())
-        else: asyncio.run(fetch_and_update())
-
+        # else: asyncio.run(fetch_and_update()) # Avoid asyncio.run if loop might be managed elsewhere
 
     def load_initial_chart_data(self): self.handle_load_refresh_chart()
+
+    def _plot_indicators(self, klines_df_for_indicators: pd.DataFrame):
+        self.sma_plot_item.clear(); self.ema_plot_item.clear(); self.rsi_plot_item.clear()
+        if klines_df_for_indicators is None or klines_df_for_indicators.empty:
+            return
+
+        # Ensure 'close' column is float
+        klines_df_for_indicators['close'] = klines_df_for_indicators['close'].astype(float)
+
+        # X-axis data (timestamps in epoch seconds)
+        # Ensure index is DatetimeIndex before converting
+        if not isinstance(klines_df_for_indicators.index, pd.DatetimeIndex):
+            self.logger.warning("Indicator klines_df index is not DatetimeIndex. Cannot plot indicators.")
+            # Attempt to convert if 'timestamp' column exists (e.g. from self.candlestick_data_for_plotting)
+            if 'timestamp' in klines_df_for_indicators.columns:
+                 klines_df_for_indicators['timestamp'] = pd.to_datetime(klines_df_for_indicators['timestamp'])
+                 klines_df_for_indicators = klines_df_for_indicators.set_index('timestamp')
+            else: # If no 'timestamp' column, try to infer from a 't' column (epoch seconds)
+                if 't' in klines_df_for_indicators.columns: # 't' would be epoch seconds from candlestick_data_for_plotting
+                    klines_df_for_indicators.index = pd.to_datetime(klines_df_for_indicators['t'], unit='s')
+                else: # Cannot determine timestamps for indicators
+                    return
+
+        x_timestamps = klines_df_for_indicators.index.astype(np.int64) // 10**9
+
+        # SMA
+        if self.sma_checkbox.isChecked() and len(klines_df_for_indicators) >= self.sma_period_spinbox.value():
+            period = self.sma_period_spinbox.value()
+            sma_series = klines_df_for_indicators['close'].rolling(window=period, min_periods=period).mean()
+            self.sma_plot_item.setData(x=x_timestamps, y=sma_series.values)
+        # EMA
+        if self.ema_checkbox.isChecked() and len(klines_df_for_indicators) >= self.ema_period_spinbox.value():
+            period = self.ema_period_spinbox.value()
+            ema_series = klines_df_for_indicators['close'].ewm(span=period, adjust=False, min_periods=period).mean()
+            self.ema_plot_item.setData(x=x_timestamps, y=ema_series.values)
+        # RSI
+        if self.rsi_checkbox.isChecked() and len(klines_df_for_indicators) >= self.rsi_period_spinbox.value() + 1: # Need one more for diff
+            period = self.rsi_period_spinbox.value()
+            delta = klines_df_for_indicators['close'].diff()
+            gain = (delta.where(delta > 0, 0.0)).ewm(com=max(1, period - 1), adjust=False, min_periods=max(1,period-1)).mean()
+            loss = (-delta.where(delta < 0, 0.0)).ewm(com=max(1, period - 1), adjust=False, min_periods=max(1,period-1)).mean()
+            rs = gain / (loss + 1e-9)
+            rsi_series = 100 - (100 / (1 + rs))
+            self.rsi_plot_item.setData(x=x_timestamps, y=rsi_series.values)
+            # Configurable OB/OS levels for RSI (example, assuming spinboxes exist or using fixed values)
+            # self.rsi_ob_line.setValue(getattr(self, 'rsi_ob_level_spinbox', QSpinBox(value=70)).value())
+            # self.rsi_os_line.setValue(getattr(self, 'rsi_os_level_spinbox', QSpinBox(value=30)).value())
+            self.rsi_ob_line.setValue(70)
+            self.rsi_os_line.setValue(30)
+
 
     @Slot(pd.DataFrame, str)
     def update_chart_data(self, klines_df: pd.DataFrame, timeframe_str: str):
         self.logger.debug(f"Updating chart with {len(klines_df)} klines for {timeframe_str}.")
-        if self.candlestick_item: self.price_plot.removeItem(self.candlestick_item); self.candlestick_item = None
-        self.sma_plot_item.clear(); self.ema_plot_item.clear(); self.rsi_plot_item.clear()
 
-        if klines_df is None or klines_df.empty: self.price_plot.clear(); self.rsi_plot_widget.clear(); return # Clear plots if no data
+        self.candlestick_data_for_plotting.clear() # Clear existing live data buffer
 
-        # Ensure 'close' column is float for indicator calculations
-        klines_df['close'] = klines_df['close'].astype(float)
-        # Timestamps for x-axis (epoch seconds)
-        x_timestamps = klines_df.index.astype(np.int64) // 10**9 # From DatetimeIndex to epoch seconds
+        if self.candlestick_item:
+            self.price_plot.removeItem(self.candlestick_item)
+            self.candlestick_item = None
 
-        chart_data = self._prepare_candlestick_data(klines_df, timeframe_str)
-        if chart_data:
-            self.candlestick_item = CandlestickItem(chart_data)
+        if klines_df is None or klines_df.empty:
+            self.price_plot.clear() # Clears candlesticks if any were manually added
+            self._plot_indicators(pd.DataFrame()) # Clear indicators
+            self.chart_status_label.setText(f"No data for {self.current_chart_symbol_tf[0]} {self.current_chart_symbol_tf[1]}")
+            return
+
+        self.candlestick_data_for_plotting = self._prepare_candlestick_data(klines_df, timeframe_str)
+
+        if self.candlestick_data_for_plotting:
+            self.candlestick_item = CandlestickItem(self.candlestick_data_for_plotting)
             self.price_plot.addItem(self.candlestick_item)
-        else: self.price_plot.clear()
+        else:
+            self.price_plot.clear() # Should not happen if klines_df was not empty
 
-        # SMA
-        if self.sma_checkbox.isChecked() and len(klines_df) >= self.sma_period_spinbox.value():
-            period = self.sma_period_spinbox.value()
-            sma_series = klines_df['close'].rolling(window=period, min_periods=period).mean()
-            self.sma_plot_item.setData(x=x_timestamps, y=sma_series.values)
-        # EMA
-        if self.ema_checkbox.isChecked() and len(klines_df) >= self.ema_period_spinbox.value():
-            period = self.ema_period_spinbox.value()
-            ema_series = klines_df['close'].ewm(span=period, adjust=False, min_periods=period).mean()
-            self.ema_plot_item.setData(x=x_timestamps, y=ema_series.values)
-        # RSI
-        if self.rsi_checkbox.isChecked() and len(klines_df) >= self.rsi_period_spinbox.value():
-            period = self.rsi_period_spinbox.value()
-            delta = klines_df['close'].diff()
-            gain = (delta.where(delta > 0, 0.0)).ewm(com=max(1, period - 1), adjust=False, min_periods=max(1,period-1)).mean() # com must be >= 0
-            loss = (-delta.where(delta < 0, 0.0)).ewm(com=max(1, period - 1), adjust=False, min_periods=max(1,period-1)).mean()
-            rs = gain / (loss + 1e-9) # Avoid division by zero
-            rsi_series = 100 - (100 / (1 + rs))
-            self.rsi_plot_item.setData(x=x_timestamps, y=rsi_series.values)
-            self.rsi_ob_line.setValue(self.rsi_period_spinbox.parent().findChild(QSpinBox, "rsi_ob_level_spinbox").value() if hasattr(self, 'rsi_ob_level_spinbox') else 70) # Example for configurable OB/OS
-            self.rsi_os_line.setValue(self.rsi_period_spinbox.parent().findChild(QSpinBox, "rsi_os_level_spinbox").value() if hasattr(self, 'rsi_os_level_spinbox') else 30)
-
+        self._plot_indicators(klines_df) # Plot indicators based on the full historical DataFrame
 
         self.price_plot.autoRange()
         self.rsi_plot_widget.autoRange()
+        self.chart_status_label.setText(f"Displaying {self.current_chart_symbol_tf[0]} {self.current_chart_symbol_tf[1]} - Historical ({len(klines_df)})")
+
+
+    @Slot(dict)
+    def handle_live_kline_data(self, kline_data: dict):
+        # kline_data is ui_kline_data from BotController (timestamps in ms)
+        # Example: {"symbol": "BTCUSDT", "interval": "1m", "t": 1672515720000, "o": "0.0010", ... "x": false}
+
+        if not self.current_chart_symbol_tf:
+            # self.logger.debug("Live kline received but no chart symbol/tf selected.")
+            return
+
+        chart_symbol, chart_tf = self.current_chart_symbol_tf
+        if kline_data['symbol'] != chart_symbol or kline_data['interval'] != chart_tf:
+            # self.logger.debug(f"Live kline for {kline_data['symbol']}/{kline_data['interval']} ignored, chart is {chart_symbol}/{chart_tf}")
+            return
+
+        # self.logger.debug(f"ChartView received live kline: S:{kline_data['symbol']} I:{kline_data['interval']} O:{kline_data['o']} C:{kline_data['c']} Closed:{kline_data['x']}")
+
+        kline_open_time_sec = kline_data['t'] / 1000.0
+        # is_closed = kline_data['x'] # We can use this if we want to treat closed/unclosed differently
+
+        new_candle_plot_data = {
+            't': kline_open_time_sec,
+            'o': float(kline_data['o']), 'h': float(kline_data['h']),
+            'l': float(kline_data['l']), 'c': float(kline_data['c']),
+            'w': self._get_candle_width_seconds(kline_data['interval'])
+        }
+
+        if not self.candlestick_data_for_plotting:
+            self.candlestick_data_for_plotting.append(new_candle_plot_data)
+        else:
+            last_plotted_candle_t = self.candlestick_data_for_plotting[-1]['t']
+            if kline_open_time_sec == last_plotted_candle_t: # Update current (last) candle
+                self.candlestick_data_for_plotting[-1] = new_candle_plot_data
+            elif kline_open_time_sec > last_plotted_candle_t: # New candle
+                self.candlestick_data_for_plotting.append(new_candle_plot_data)
+                # Optional: Limit buffer size
+                max_live_candles = 300 # Keep roughly same as historical load
+                if len(self.candlestick_data_for_plotting) > max_live_candles:
+                    self.candlestick_data_for_plotting = self.candlestick_data_for_plotting[-max_live_candles:]
+            else: # Old kline, should not happen with live stream under normal circumstances
+                self.logger.warning(f"Received old kline in live update: OpenTime {kline_open_time_sec} vs LastPlotted {last_plotted_candle_t}")
+                return # Don't update chart with out-of-order old data
+
+        if self.candlestick_item:
+            self.candlestick_item.data = self.candlestick_data_for_plotting # Update data in item
+            self.candlestick_item.generatePicture() # Regenerate picture
+            # self.candlestick_item.update() # Trigger repaint via paint method
+            self.candlestick_item.informViewBoundsChanged() # More robust way to signal update
+            self.price_plot.update() # Try updating the plot view directly
+
+        # Update indicators using a DataFrame derived from the current candlestick_data_for_plotting
+        if self.candlestick_data_for_plotting:
+            # Construct DataFrame for indicators
+            # Column names must match what _plot_indicators expects (e.g., 'open', 'high', 'low', 'close', and a DatetimeIndex)
+            live_df_for_indicators = pd.DataFrame([{
+                'timestamp': pd.to_datetime(cd['t'], unit='s'), # Convert epoch seconds back to Datetime
+                'open': cd['o'], 'high': cd['h'], 'low': cd['l'], 'close': cd['c']
+            } for cd in self.candlestick_data_for_plotting])
+
+            if not live_df_for_indicators.empty:
+                live_df_for_indicators = live_df_for_indicators.set_index('timestamp')
+                # Plot indicators using the tail of the data to keep it responsive
+                self._plot_indicators(live_df_for_indicators.tail(200))
+
+        # self.price_plot.autoRange() # Auto-range can be jumpy on live updates
+        # self.rsi_plot_widget.autoRange() # Consider conditional auto-range or manual range updates
 
 
 if __name__ == '__main__':
