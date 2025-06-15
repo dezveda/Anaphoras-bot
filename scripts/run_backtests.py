@@ -79,8 +79,24 @@ async def main():
         'atr_period_for_sl_tp': 14,
         'atr_period_for_backtest': 14, # For BacktestEngine to provide ATR
         'asset_quantity_precision': 3, 'asset_price_precision': 2,
-        'min_order_qty': 0.001
+        'min_order_qty': 0.001,
+
+        # New Trend Adaptation Params for IndicatorHeuristicStrategy
+        'filter_by_macro_trend': True, # Enable trend filtering
+        'strict_macro_filter': False,  # Allow counter-trend trades but adjust score/threshold
+        'score_adjust_macro_bull': 1.0,
+        'score_adjust_macro_bear': -1.0,
+        'threshold_boost_with_macro': 0.5, # Make it easier to trade with trend
+        'threshold_penalty_counter_macro': 1.0 # Make it harder to trade against trend
     }
+    # Note: For this script to fully test TrendAdaptation integration, BacktestEngine
+    # would need to manage multiple strategies or IndicatorHeuristicStrategy would need
+    # a way to get regime data (e.g. from a pre-calculated series).
+    # For now, we'll see logs about TrendAdapter not being available if BacktestEngine
+    # doesn't provide strategy_engine_ref to IndicatorHeuristicStrategy's __init__.
+    # The BacktestEngine currently passes strategy_params directly, not a strategy_engine_ref.
+    # To properly test this, IndicatorHeuristicStrategy needs to be robust to strategy_engine_ref being None.
+
     backtester_heuristic = BacktestEngine(
         market_data_provider=market_data_provider,
         strategy_class=IndicatorHeuristicStrategy,

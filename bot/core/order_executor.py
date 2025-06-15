@@ -25,6 +25,13 @@ class OrderManager:
         self.logger = logging.getLogger('algo_trader_bot.OrderManager') # More specific logger
         self.active_orders: Dict[str, Dict[str, Any]] = {}
 
+        # P&L Tracking
+        self.realized_pnl_session: float = 0.0
+        self.open_positions_pnl_cache: Dict[str, Dict[str, Any]] = {} # Not actively used if fetching fresh, but can be for future opt.
+        self.last_mark_prices: Dict[str, float] = {} # symbol: mark_price
+        self.pnl_update_callback: Optional[Callable[[], asyncio.Task]] = None
+
+
     async def get_available_trading_balance(self, asset: str = 'USDT') -> Optional[float]:
         self.logger.debug(f"Fetching available trading balance for {asset} (async).")
         try:
@@ -158,8 +165,26 @@ class OrderManager:
             if status in ['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED', 'PARTIALLY_FILLED_CANCELED']:
                 final_key = key_to_update or order_id_str
                 self.logger.info(f"Order {final_key} final state via WS: {status}. Consider moving from active_orders.")
+
+            # P&L Calculation on Fill
+            if status == 'FILLED':
+                rp_for_trade = float(order_info.get('rp', 0.0)) # 'rp' is Realized Profit for this trade
+                if rp_for_trade != 0: # Only update if there's actual P&L (e.g. not for entry trades unless fees make it non-zero)
+                    self.realized_pnl_session += rp_for_trade
+                    self.logger.info(f"Trade Filled. Realized P&L for trade ({order_info.get('s')}): {rp_for_trade}. Session Realized P&L: {self.realized_pnl_session:.4f}")
+
+                if self.pnl_update_callback:
+                    # self.logger.debug(f"P&L update callback invoked due to FILLED order {client_order_id or order_id_str}")
+                    asyncio.create_task(self.pnl_update_callback()) # Ensure it's awaited or runs in loop
+
         elif event_type == 'ACCOUNT_UPDATE':
             self.logger.debug(f"OM WS ACCOUNT_UPDATE: {str(order_data_event)[:200]}")
+            # This event often includes position updates, which can be used for P&L.
+            # However, relying on specific parsing here is complex.
+            # For now, BotController will trigger pnl_update_callback on ACCOUNT_UPDATE.
+            # If self.pnl_update_callback and "ACCOUNT_UPDATE_SPECIFIC_LOGIC_NEEDED":
+            #    asyncio.create_task(self.pnl_update_callback())
+
             # Balance updates could be processed here to inform RiskManager more proactively if needed.
             # For example, extract 'a' (assets) from data.get('a', {})
             # And update a balance cache or directly call RM method (if RM is thread-safe or call is scheduled)
@@ -270,6 +295,60 @@ class OrderManager:
         except Exception as e:
             self.logger.error(f"Error closing position for {symbol} ({position_side_to_close}): {e}", exc_info=True)
             return None
+
+    # --- P&L Related Methods ---
+    def update_mark_price_for_pnl(self, symbol: str, mark_price: float):
+        """Called by BotController when a new mark price is available for a symbol."""
+        self.last_mark_prices[symbol] = mark_price
+        # self.logger.debug(f"Updated mark price for {symbol}: {mark_price}")
+        # Note: Actual P&L calculation will be triggered by BotController calling calculate_all_open_positions_pnl
+
+    async def calculate_all_open_positions_pnl(self) -> Dict[str, Any]:
+        """
+        Calculates unrealized P&L for all open positions.
+        Returns a dictionary: {'total_unrealized': float, 'positions_detail': {symbol: pnl_float, ...}}
+        """
+        total_unrealized_pnl = 0.0
+        positions_pnl_detail: Dict[str, float] = {}
+
+        try:
+            # Fetches all positions. For specific symbols, use get_position_information(symbol=...)
+            current_positions = await self.binance_connector.get_position_information()
+            if current_positions is None:
+                self.logger.warning("Failed to fetch position information for P&L calculation.")
+                return {'total_unrealized': 0.0, 'positions_detail': {}}
+
+            for pos_data in current_positions:
+                symbol = pos_data.get('symbol')
+                if not symbol: continue
+
+                try:
+                    entry_price = float(pos_data.get('entryPrice', 0))
+                    quantity = float(pos_data.get('positionAmt', 0))
+                    mark_price = self.last_mark_prices.get(symbol)
+                except (ValueError, TypeError) as ve:
+                    self.logger.error(f"Could not parse position data for {symbol}: {ve}. Data: {pos_data}")
+                    continue
+
+                if quantity != 0 and mark_price is not None and entry_price > 0:
+                    unrealized_pnl = 0.0
+                    # Standard P&L calculation: (Mark Price - Entry Price) * Quantity
+                    # For shorts, quantity is negative, so (Mark Price - Entry Price) * (-AbsQuantity) = (Entry Price - Mark Price) * AbsQuantity
+                    unrealized_pnl = (mark_price - entry_price) * quantity
+
+                    total_unrealized_pnl += unrealized_pnl
+                    positions_pnl_detail[symbol] = unrealized_pnl
+                    # self.logger.debug(f"P&L for {symbol}: Qty={quantity}, Entry={entry_price}, Mark={mark_price}, UPNL={unrealized_pnl:.2f}")
+
+            # self.logger.debug(f"Total Unrealized P&L: {total_unrealized_pnl:.2f}, Details: {positions_pnl_detail}")
+            return {'total_unrealized': total_unrealized_pnl, 'positions_detail': positions_pnl_detail}
+
+        except Exception as e:
+            self.logger.error(f"Error calculating open positions P&L: {e}", exc_info=True)
+            return {'total_unrealized': 0.0, 'positions_detail': {}} # Return zero P&L on error
+
+    def get_session_realized_pnl(self) -> float:
+        return self.realized_pnl_session
 
 
 if __name__ == '__main__':

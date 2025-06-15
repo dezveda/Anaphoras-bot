@@ -26,6 +26,17 @@ class BackendSignals(QObject):
     backtest_trades_ready = Signal(list)      # For the list of simulated trades
     backtest_equity_curve_ready = Signal(list) # For equity curve data points
 
+    # ChartView live updates
+    live_kline_updated = Signal(dict)
+
+    # Error and status bar signals for better UI feedback
+    error_dialog_requested = Signal(str, str)  # title, message
+    status_bar_message_updated = Signal(str, int) # message, timeout_ms (0 for persistent)
+
+    # Chart specific visualization signals
+    chart_new_trade_marker = Signal(dict) # {'symbol': str, 'timestamp': float_epoch_sec, 'price': float, 'side': 'BUY'/'SELL', 'quantity': float}
+    chart_position_update = Signal(dict) # {'symbol': str, 'entry_price': float, 'quantity': float, 'side': 'LONG'/'SHORT'/'FLAT', 'timestamp': float_epoch_sec}
+
     def __init__(self):
         super().__init__()
 
@@ -53,6 +64,20 @@ if __name__ == '__main__':
     signals.backtest_trades_ready.connect(handle_bt_trades)
     signals.backtest_equity_curve_ready.connect(handle_bt_equity)
 
+    # Example usage for new signals
+    def handle_error_dialog(title: str, message: str): print(f"UI Slot (Error Dialog): Title='{title}', Msg='{message}'")
+    def handle_statusbar_msg(message: str, timeout: int): print(f"UI Slot (StatusBar): Msg='{message}', Timeout={timeout}ms")
+    def handle_live_kline(kline_data: dict): print(f"UI Slot (Live Kline): {kline_data.get('s')} {kline_data.get('c')}")
+    def handle_trade_marker(trade_info: dict): print(f"UI Slot (Trade Marker): {trade_info}")
+    def handle_pos_update(pos_info: dict): print(f"UI Slot (Position Update): {pos_info}")
+
+    signals.error_dialog_requested.connect(handle_error_dialog)
+    signals.status_bar_message_updated.connect(handle_statusbar_msg)
+    signals.live_kline_updated.connect(handle_live_kline)
+    signals.chart_new_trade_marker.connect(handle_trade_marker)
+    signals.chart_position_update.connect(handle_pos_update)
+
+
     signals.status_updated.emit("Bot Initializing...")
     signals.balance_updated.emit(10000.0)
     signals.log_message_appended.emit("Test log message from backend.")
@@ -64,6 +89,12 @@ if __name__ == '__main__':
     signals.backtest_summary_results_ready.emit({'pnl': 100, 'trades': 5})
     signals.backtest_trades_ready.emit([{'symbol':'BTCUSDT', 'pnl': 50}, {'symbol':'BTCUSDT', 'pnl': 50}])
     signals.backtest_equity_curve_ready.emit([{'ts':1, 'bal':100},{'ts':2, 'bal':110}])
+
+    signals.error_dialog_requested.emit("Test Error", "This is a test error message.")
+    signals.status_bar_message_updated.emit("Test status bar message.", 3000)
+    signals.live_kline_updated.emit({'s': 'BTCUSDT', 'c': '50000', 'i': '1m'})
+    signals.chart_new_trade_marker.emit({'symbol': 'BTCUSDT', 'timestamp': 1672515780.0, 'price': 25000, 'side': 'BUY', 'quantity': 0.1})
+    signals.chart_position_update.emit({'symbol': 'BTCUSDT', 'entry_price': 25000, 'quantity': 0.1, 'side': 'LONG', 'timestamp': 1672515780.0})
 
 
     signals.status_updated.disconnect(handle_status)
