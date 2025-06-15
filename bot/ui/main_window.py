@@ -1,6 +1,6 @@
 import sys
 import logging
-from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QLabel
+from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QLabel, QMessageBox
 from PySide6.QtCore import Slot, QMetaObject, Qt, Signal as PySideSignal
 from typing import Any, Optional
 
@@ -89,6 +89,15 @@ class MainWindow(QMainWindow):
             # ChartView signals
             if hasattr(self.chart_view, 'handle_live_kline_data'):
                 signals.live_kline_updated.connect(self.chart_view.handle_live_kline_data)
+            # ChartView visualization signals
+            if hasattr(self.chart_view, 'handle_new_trade_marker'):
+                signals.chart_new_trade_marker.connect(self.chart_view.handle_new_trade_marker)
+            if hasattr(self.chart_view, 'handle_position_update_for_chart'):
+                signals.chart_position_update.connect(self.chart_view.handle_position_update_for_chart)
+
+            # MainWindow general feedback signals
+            signals.error_dialog_requested.connect(self.show_error_dialog)
+            signals.status_bar_message_updated.connect(self.show_status_bar_message)
 
             self.logger.info("MainWindow connected to global backend signals for all views.")
         except AttributeError as e:
@@ -101,6 +110,18 @@ class MainWindow(QMainWindow):
         logger_to_use.info("Main window closeEvent triggered.")
         self.aboutToClose.emit()
         event.accept()
+
+    @Slot(str, str)
+    def show_error_dialog(self, title: str, message: str):
+        self.logger.info(f"Displaying error dialog: Title='{title}', Message='{message}'")
+        QMessageBox.critical(self, title, message)
+
+    @Slot(str, int)
+    def show_status_bar_message(self, message: str, timeout: int = 5000):
+        # Ensure status bar is visible (usually is by default if messages are shown)
+        # self.statusBar().setVisible(True) # May not be needed
+        self.statusBar().showMessage(message, timeout)
+        self.logger.debug(f"Status bar message: '{message}', Timeout: {timeout}ms")
 
 if __name__ == '__main__':
     # ... (main test block remains the same) ...

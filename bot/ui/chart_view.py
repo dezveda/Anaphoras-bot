@@ -56,7 +56,11 @@ class ChartView(QWidget):
         self._init_ui()
         self._connect_signals()
         self.candlestick_data_for_plotting: List[Dict[str, Any]] = []
-        self.current_chart_symbol_tf: Optional[Tuple[str, str]] = None
+        self.current_chart_symbol_tf: Optional[Tuple[str, str]] = None # e.g. ('BTCUSDT', '1h')
+
+        self.trade_markers_plot: Optional[pg.ScatterPlotItem] = None
+        self.position_line: Optional[pg.InfiniteLine] = None
+        # self.position_fill_item = None # Deferred
         # self.load_initial_chart_data() # Called from gui_launcher after window is shown
 
     def _init_ui(self):
@@ -102,6 +106,11 @@ class ChartView(QWidget):
         self.date_axis = pg.DateAxisItem(orientation='bottom')
         self.price_plot.setAxisItems({'bottom': self.date_axis})
         self.candlestick_item: Optional[CandlestickItem] = None
+
+        # Add ScatterPlotItem for trade markers
+        self.trade_markers_plot = pg.ScatterPlotItem(name="Trades", pxMode=False) # pxMode=False for scalable symbols
+        self.price_plot.addItem(self.trade_markers_plot)
+
         self.sma_plot_item = self.price_plot.plot(pen='y', name='SMA')
         self.ema_plot_item = self.price_plot.plot(pen='c', name='EMA')
 
@@ -243,12 +252,21 @@ class ChartView(QWidget):
 
         self.candlestick_data_for_plotting.clear() # Clear existing live data buffer
 
+        # Clear previous plot items related to data
         if self.candlestick_item:
             self.price_plot.removeItem(self.candlestick_item)
             self.candlestick_item = None
+        if self.trade_markers_plot:
+            self.trade_markers_plot.clear() # Clear trade markers
+        if self.position_line:
+            self.price_plot.removeItem(self.position_line)
+            self.position_line = None
+        # if self.position_fill_item: # If implementing fill
+        #     self.price_plot.removeItem(self.position_fill_item)
+        #     self.position_fill_item = None
 
         if klines_df is None or klines_df.empty:
-            self.price_plot.clear() # Clears candlesticks if any were manually added
+            # self.price_plot.clear() # This would also remove indicator lines if not careful
             self._plot_indicators(pd.DataFrame()) # Clear indicators
             self.chart_status_label.setText(f"No data for {self.current_chart_symbol_tf[0]} {self.current_chart_symbol_tf[1]}")
             return
@@ -334,6 +352,62 @@ class ChartView(QWidget):
         # self.price_plot.autoRange() # Auto-range can be jumpy on live updates
         # self.rsi_plot_widget.autoRange() # Consider conditional auto-range or manual range updates
 
+    @Slot(dict)
+    def handle_new_trade_marker(self, trade_info: dict):
+        if not self.current_chart_symbol_tf or \
+           trade_info['symbol'] != self.current_chart_symbol_tf[0] or \
+           not self.trade_markers_plot:
+            return
+
+        timestamp = trade_info['timestamp'] # Epoch seconds
+        price = trade_info['price']
+        side = trade_info['side'] # 'BUY' or 'SELL'
+
+        # symbol_char = 't1' if side == 'BUY' else 't2' # Triangle up/down
+        # pg.graphicsItems.ScatterPlotItem.Symbols uses different keys
+        symbol_char = 's' if side == 'BUY' else 's' # Square for buy, 'd' for sell diamond
+        color = pg.mkBrush('g') if side == 'BUY' else pg.mkBrush('r')
+        border_pen = pg.mkPen('w', width=1)
+        size = 12
+
+        # self.logger.debug(f"Adding trade marker: TS {timestamp}, Px {price}, Side {side}")
+        self.trade_markers_plot.addPoints([{'pos': (timestamp, price),
+                                            'symbol': symbol_char,
+                                            'brush': color,
+                                            'pen': border_pen,
+                                            'size': size,
+                                            'data': trade_info}]) # Store original info if needed
+
+    @Slot(dict)
+    def handle_position_update_for_chart(self, pos_data: dict):
+        if not self.current_chart_symbol_tf or \
+           pos_data['symbol'] != self.current_chart_symbol_tf[0]:
+            return
+
+        # Clear previous position line and fill
+        if self.position_line:
+            self.price_plot.removeItem(self.position_line)
+            self.position_line = None
+        # if self.position_fill_item: # If implementing fill
+        #     self.price_plot.removeItem(self.position_fill_item)
+        #     self.position_fill_item = None
+
+        if pos_data['side'] != 'FLAT' and pos_data['entry_price'] > 0:
+            entry_price = pos_data['entry_price']
+            pos_side_label = pos_data['side']
+            self.logger.info(f"Displaying position line for {pos_data['symbol']} {pos_side_label} @ {entry_price}")
+
+            self.position_line = pg.InfiniteLine(
+                pos=entry_price,
+                angle=0,
+                movable=False,
+                pen=pg.mkPen('y', style=Qt.PenStyle.DashLine, width=2), # Corrected Qt.DashLine
+                label=f"{pos_side_label} Entry: {entry_price:.{self.price_plot.axes['left']['item'].tickFormatters[0][1] if self.price_plot.axes['left']['item'].tickFormatters else 2}f}" # Dynamic precision
+            )
+            self.price_plot.addItem(self.position_line)
+
+            # Optional: P&L Fill (deferred for simplicity)
+            # ...
 
 if __name__ == '__main__':
     # ... (Standalone test code from previous step can be adapted)

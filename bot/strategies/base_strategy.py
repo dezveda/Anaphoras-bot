@@ -16,8 +16,10 @@ class BaseStrategy(ABC):
                  order_manager: OrderManager,
                  market_data_provider: MarketDataProvider,
                  risk_manager: BasicRiskManager,
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None,
+                 strategy_engine_ref: Optional[Any] = None): # Added strategy_engine_ref
         self.strategy_id = strategy_id
+        self.strategy_engine_ref = strategy_engine_ref # Store the reference
         # Store strategy_type_name in instance params if not already there from engine
         # This ensures it's available even if strategy is instantiated outside engine
         params_to_store = params.copy()
