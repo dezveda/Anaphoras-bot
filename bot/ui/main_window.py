@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
             if hasattr(self.backtest_view, 'plot_equity_curve'): # For equity curve
                 signals.backtest_equity_curve_ready.connect(self.backtest_view.plot_equity_curve)
 
+            # ChartView signals
+            if hasattr(self.chart_view, 'handle_live_kline_data'):
+                signals.live_kline_updated.connect(self.chart_view.handle_live_kline_data)
+
             self.logger.info("MainWindow connected to global backend signals for all views.")
         except AttributeError as e:
             self.logger.error(f"Error connecting global signals: {e}. View might be missing a slot.", exc_info=True)

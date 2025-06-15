@@ -50,6 +50,7 @@ class BotController(QObject):
         self.bot_status: str = "Uninitialized"
         self.is_running: bool = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.current_chart_kline_subscription_id: Optional[str] = None # For live chart updates
 
         log_level_val = self.config_manager.load_log_level_from_env() # Initial log level from .env
         self.current_log_level_str: str = logging.getLevelName(log_level_val)
@@ -313,5 +314,143 @@ class BotController(QObject):
         msg=f"Market close for {position_side_to_close} {symbol} "; msg += "placed." if response and (response.get('status')=='FILLED' or response.get('status')=='NEW') else f"failed: {response.get('msg') if response else 'No API response'}"
         self.signals.log_message_appended.emit(msg); await asyncio.sleep(1)
         if self.loop and self.loop.is_running(): asyncio.create_task(self.request_positions_update()); asyncio.create_task(self.request_open_orders_update())
+
+    # --- Live Kline Data for Chart ---
+    async def subscribe_to_chart_klines(self, symbol: str, timeframe: str):
+        if not self.market_data_provider:
+            self.logger.error("MarketDataProvider not available for chart kline subscription.")
+            return
+
+        # Unsubscribe from previous chart kline stream if any
+        if self.current_chart_kline_subscription_id:
+            self.logger.info(f"Unsubscribing from previous chart kline stream: {self.current_chart_kline_subscription_id}")
+            await self.market_data_provider.unsubscribe_from_stream_by_id(self.current_chart_kline_subscription_id)
+            self.current_chart_kline_subscription_id = None
+
+        self.logger.info(f"Subscribing to kline stream for chart: {symbol}@{timeframe}")
+        # The callback _handle_live_kline_for_ui needs to be defined
+        new_sub_id = await self.market_data_provider.subscribe_to_kline_stream(
+            symbol, timeframe, self._handle_live_kline_for_ui
+        )
+        if new_sub_id:
+            self.current_chart_kline_subscription_id = new_sub_id
+            self.logger.info(f"Successfully subscribed to chart kline stream {symbol}@{timeframe}, ID: {new_sub_id}")
+        else:
+            self.logger.error(f"Failed to subscribe to chart kline stream {symbol}@{timeframe}")
+
+    async def _handle_live_kline_for_ui(self, raw_ws_message: dict):
+        """
+        Handles incoming kline data from WebSocket, formats it, and emits a signal for the UI.
+        raw_ws_message example:
+        {
+            "stream": "btcusdt@kline_1m",
+            "data": {
+                "e": "kline",           // Event type
+                "E": 1672515780000,     // Event time
+                "s": "BTCUSDT",         // Symbol
+                "k": {
+                    "t": 1672515720000, // Kline start time (ms)
+                    "T": 1672515779999, // Kline close time (ms)
+                    "s": "BTCUSDT",     // Symbol
+                    "i": "1m",          // Interval
+                    "f": 100,           // First trade ID
+                    "L": 200,           // Last trade ID
+                    "o": "0.0010",      // Open price
+                    "c": "0.0020",      // Close price
+                    "h": "0.0025",      // High price
+                    "l": "0.0015",      // Low price
+                    "v": "1000",        // Base asset volume
+                    "n": 100,           // Number of trades
+                    "x": false,         // Is this kline closed?
+                    "q": "1.0000",      // Quote asset volume
+                    "V": "500",         // Taker buy base asset volume
+                    "Q": "0.500",       // Taker buy quote asset volume
+                    "B": "12345"        // Ignore
+                }
+            }
+        }
+        """
+        try:
+            kline_payload = raw_ws_message.get('data', {}).get('k', {})
+            if not kline_payload:
+                self.logger.warning(f"Received kline WS message with empty payload: {raw_ws_message}")
+                return
+
+            ui_kline_data = {
+                "symbol": kline_payload.get('s'),
+                "interval": kline_payload.get('i'),
+                "t": kline_payload.get('t'),      # Kline open time (ms)
+                "o": kline_payload.get('o'),
+                "h": kline_payload.get('h'),
+                "l": kline_payload.get('l'),
+                "c": kline_payload.get('c'),
+                "v": kline_payload.get('v'),      # Base asset volume
+                "T": kline_payload.get('T'),      # Kline close time (ms)
+                "x": kline_payload.get('x', False) # Is this kline closed?
+            }
+
+            # Basic validation
+            if not all([ui_kline_data['symbol'], ui_kline_data['interval'], isinstance(ui_kline_data['t'], (int, float))]):
+                self.logger.warning(f"Received incomplete kline data for UI: {ui_kline_data}")
+                return
+
+            # self.logger.debug(f"BC Emitting live_kline_updated: S:{ui_kline_data['symbol']} I:{ui_kline_data['interval']} O:{ui_kline_data['o']} C:{ui_kline_data['c']} Closed:{ui_kline_data['x']}")
+            self.signals.live_kline_updated.emit(ui_kline_data)
+
+        except Exception as e:
+            self.logger.error(f"Error processing live kline for UI: {e}. Message: {raw_ws_message}", exc_info=True)
+
+    # --- Internal Signal Connections & Handlers ---
+    def _connect_internal_signals(self):
+        # Example: self.order_manager.signals.order_event.connect(self.handle_order_event_from_om)
+        # This method is for internal Qt signals if needed, not for MDP data callbacks.
+        pass
+
+    async def handle_user_data_from_mdp(self, user_data_event: Dict):
+        # This is a generic handler for various user data events.
+        # It could be ORDER_TRADE_UPDATE, ACCOUNT_UPDATE, etc.
+        # For BotController, it might update balance or trigger UI refreshes.
+        # OrderManager and StrategyEngine also subscribe to user data directly for their specific needs.
+
+        event_type = user_data_event.get('e')
+        # self.logger.debug(f"BotController received user_data_event: {event_type}")
+
+        if event_type == 'ACCOUNT_UPDATE':
+            # self.logger.debug(f"Account update event in BotController: {user_data_event}")
+            await self.update_dashboard_balance() # Update balance on any account update
+            # Potentially parse further for specific balance changes to emit more detailed signals
+            # for asset_info in user_data_event.get('a', {}).get('B', []): # Balances
+            #     if asset_info['a'] == 'USDT': # Example: USDT balance
+            #         self.signals.usdt_balance_updated.emit(float(asset_info['f'])) # Free balance
+
+        elif event_type == 'ORDER_TRADE_UPDATE':
+            # While OrderManager handles its own orders, BotController might log all order updates
+            # or trigger general UI refreshes (e.g., open orders list)
+            # self.logger.debug(f"Order trade update event in BotController: {user_data_event.get('o', {}).get('c')}")
+            await self.request_open_orders_update() # Refresh open orders on any order update
+            await self.request_positions_update() # Refresh positions
+
+    async def update_dashboard_balance(self):
+        if self.order_manager:
+            try:
+                balance_info = await self.order_manager.get_account_balance() # USDT balance
+                if balance_info:
+                    usdt_balance = next((item['balance'] for item in balance_info if item['asset'] == 'USDT'), None)
+                    if usdt_balance is not None:
+                        self.signals.usdt_balance_updated.emit(float(usdt_balance))
+                        # self.logger.debug(f"Emitted USDT balance update: {usdt_balance}")
+            except Exception as e:
+                self.logger.error(f"Error updating dashboard balance: {e}", exc_info=True)
+
+    def handle_btc_mark_price_update(self, mark_price_data: dict): # Sync for direct Qt signal
+        # Example mark_price_data: {'e': 'markPriceUpdate', 'E': 1626247267000, 's': 'BTCUSDT', 'p': '33000.00', ...}
+        # This is called directly by the MDP's WebSocket handler thread (via QtQueuedConnection)
+        if mark_price_data and mark_price_data.get('s') == 'BTCUSDT':
+            price_str = mark_price_data.get('p', "0.0")
+            try:
+                price = float(price_str)
+                self.signals.btc_mark_price_updated.emit(price) # Emit float price
+            except ValueError:
+                self.logger.error(f"Could not parse BTC mark price: {price_str}")
 
 ```
